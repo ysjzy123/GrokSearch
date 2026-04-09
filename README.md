@@ -28,6 +28,13 @@
 
 > 说明：本项目是 **独立的搜索 MCP 工具**，与 `cccc`、`webcoding` 无任何关联。
 
+## 上游与维护
+
+- 当前维护与发布：`ysjzy123`
+- 上游项目与原始作者：[`GuDaStudio/GrokSearch`](https://github.com/GuDaStudio/GrokSearch/tree/grok-with-tavily) 的 `grok-with-tavily` 分支，作者 `GuDaStudio`
+- 维护说明：本仓库是在上游基础上继续整理、修复和发布的独立仓库
+- 详细署名见：[AUTHORS.md](./AUTHORS.md)
+
 ## 为什么是这版
 
 这版仓库重点强调几个清晰的改进方向：
