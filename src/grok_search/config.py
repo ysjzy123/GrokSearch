@@ -10,7 +10,7 @@ class Config:
         '"git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily","grok-search"],'
         '"env":{"GUDA_API_KEY":"your-guda-api-key"}}\''
     )
-    _DEFAULT_MODEL = "grok-4.20-beta"
+    _DEFAULT_MODEL = "grok-4.1-fast"
     _DEFAULT_GUDA_BASE_URL = "https://code.guda.studio"
 
     def __new__(cls):

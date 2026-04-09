@@ -161,7 +161,7 @@ uv tool install -e .
 |----------|----------|---------|-------------|
 | `GROK_API_URL` | Yes | - | OpenAI-compatible Grok endpoint |
 | `GROK_API_KEY` | Yes | - | Grok API key |
-| `GROK_MODEL` | No | `grok-4.20-beta` | default model |
+| `GROK_MODEL` | No | `grok-4.1-fast` | default model |
 | `TAVILY_API_URL` | No | `https://api.tavily.com` | Tavily endpoint |
 | `TAVILY_API_KEY` | No | - | Tavily key |
 | `TAVILY_ENABLED` | No | `true` | enable Tavily |
