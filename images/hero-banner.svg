@@ -1,0 +1,91 @@
+<svg width="1600" height="720" viewBox="0 0 1600 720" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Grok Search MCP Hero Banner</title>
+  <desc id="desc">Original banner for the Grok Search MCP repository showing search, aggregation, fetch, map, and evidence flow.</desc>
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="1480" y2="660" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="0.52" stop-color="#102A43"/>
+      <stop offset="1" stop-color="#123524"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#22C55E"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="28" flood-color="#020617" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="720" rx="36" fill="url(#bg)"/>
+  <circle cx="1310" cy="122" r="164" fill="#38BDF8" fill-opacity="0.10"/>
+  <circle cx="1460" cy="576" r="190" fill="#22C55E" fill-opacity="0.10"/>
+  <circle cx="196" cy="606" r="156" fill="#F59E0B" fill-opacity="0.08"/>
+
+  <g filter="url(#shadow)">
+    <rect x="78" y="78" width="660" height="564" rx="28" fill="url(#panel)" stroke="rgba(255,255,255,0.18)"/>
+    <rect x="862" y="118" width="660" height="484" rx="28" fill="url(#panel)" stroke="rgba(255,255,255,0.18)"/>
+  </g>
+
+  <text x="128" y="162" fill="#E2E8F0" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24" font-weight="700" letter-spacing="2">SEARCH MCP</text>
+  <text x="128" y="246" fill="#F8FAFC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="72" font-weight="800">grok-search</text>
+  <text x="128" y="312" fill="#86EFAC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="700">Precise search. Aggregated sources. Auditable evidence.</text>
+  <text x="128" y="390" fill="#CBD5E1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28">A standalone MCP focused on AI search, source aggregation,</text>
+  <text x="128" y="428" fill="#CBD5E1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28">web fetching, site mapping, and structured search planning.</text>
+
+  <g>
+    <rect x="128" y="486" width="186" height="56" rx="18" fill="#0EA5E9" fill-opacity="0.18" stroke="#38BDF8"/>
+    <text x="171" y="521" fill="#E0F2FE" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24" font-weight="700">web_search</text>
+    <rect x="330" y="486" width="186" height="56" rx="18" fill="#16A34A" fill-opacity="0.18" stroke="#22C55E"/>
+    <text x="379" y="521" fill="#DCFCE7" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24" font-weight="700">get_sources</text>
+    <rect x="532" y="486" width="142" height="56" rx="18" fill="#F59E0B" fill-opacity="0.18" stroke="#FBBF24"/>
+    <text x="569" y="521" fill="#FEF3C7" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24" font-weight="700">web_fetch</text>
+  </g>
+
+  <g>
+    <rect x="128" y="564" width="142" height="52" rx="16" fill="#A855F7" fill-opacity="0.18" stroke="#C084FC"/>
+    <text x="167" y="596" fill="#F3E8FF" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="700">web_map</text>
+    <rect x="286" y="564" width="188" height="52" rx="16" fill="#14B8A6" fill-opacity="0.18" stroke="#2DD4BF"/>
+    <text x="336" y="596" fill="#CCFBF1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="700">planning</text>
+    <rect x="490" y="564" width="184" height="52" rx="16" fill="#EF4444" fill-opacity="0.18" stroke="#F87171"/>
+    <text x="529" y="596" fill="#FEE2E2" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="700">evidence</text>
+  </g>
+
+  <g>
+    <text x="916" y="174" fill="#E2E8F0" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="26" font-weight="800">Search Flow</text>
+
+    <rect x="916" y="220" width="190" height="82" rx="22" fill="#0EA5E9" fill-opacity="0.16" stroke="#38BDF8"/>
+    <text x="972" y="270" fill="#E0F2FE" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28" font-weight="800">Clients</text>
+    <text x="950" y="296" fill="#BAE6FD" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18">Codex / Claude / Gemini</text>
+
+    <rect x="1188" y="220" width="200" height="82" rx="22" fill="#F8FAFC" fill-opacity="0.08" stroke="#E2E8F0" stroke-opacity="0.35"/>
+    <text x="1236" y="270" fill="#F8FAFC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28" font-weight="800">MCP Core</text>
+    <text x="1234" y="296" fill="#CBD5E1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18">search orchestration</text>
+
+    <rect x="900" y="376" width="186" height="82" rx="22" fill="#16A34A" fill-opacity="0.16" stroke="#22C55E"/>
+    <text x="949" y="426" fill="#DCFCE7" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28" font-weight="800">Grok</text>
+    <text x="934" y="452" fill="#BBF7D0" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18">AI answer synthesis</text>
+
+    <rect x="1112" y="376" width="186" height="82" rx="22" fill="#A855F7" fill-opacity="0.16" stroke="#C084FC"/>
+    <text x="1158" y="426" fill="#F3E8FF" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28" font-weight="800">Tavily</text>
+    <text x="1143" y="452" fill="#E9D5FF" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18">search / extract / map</text>
+
+    <rect x="1324" y="376" width="186" height="82" rx="22" fill="#F59E0B" fill-opacity="0.16" stroke="#FBBF24"/>
+    <text x="1361" y="426" fill="#FEF3C7" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28" font-weight="800">Firecrawl</text>
+    <text x="1364" y="452" fill="#FDE68A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18">search / scrape fallback</text>
+
+    <rect x="1092" y="520" width="236" height="56" rx="18" fill="url(#accent)" fill-opacity="0.18" stroke="url(#accent)"/>
+    <text x="1117" y="555" fill="#F8FAFC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24" font-weight="800">sources + trace + evidence</text>
+
+    <path d="M1106 261H1176" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M1288 304V352" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M1204 304V352" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M1012 304V352" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M993 458V520H1210" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M1205 458V520" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+    <path d="M1417 458V520H1210" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

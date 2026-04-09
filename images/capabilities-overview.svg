@@ -1,0 +1,68 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Grok Search MCP Capabilities Overview</title>
+  <desc id="desc">Original overview card showing the main capability groups of the Grok Search MCP project.</desc>
+  <defs>
+    <linearGradient id="bg2" x1="160" y1="80" x2="1440" y2="820" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#E2E8F0"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#22C55E"/>
+      <stop offset="1" stop-color="#15803D"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#D97706"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#A855F7"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="900" rx="36" fill="url(#bg2)"/>
+  <text x="112" y="126" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="54" font-weight="800">What This MCP Does</text>
+  <text x="112" y="174" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="26">A visual summary of the repository’s core search, retrieval, and evidence features.</text>
+
+  <g filter="url(#soft)">
+    <rect x="112" y="234" width="660" height="230" rx="28" fill="white"/>
+    <rect x="828" y="234" width="660" height="230" rx="28" fill="white"/>
+    <rect x="112" y="514" width="660" height="230" rx="28" fill="white"/>
+    <rect x="828" y="514" width="660" height="230" rx="28" fill="white"/>
+  </g>
+
+  <g>
+    <rect x="148" y="268" width="72" height="72" rx="20" fill="url(#blue)"/>
+    <text x="246" y="314" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="800">Search and Aggregation</text>
+    <text x="148" y="378" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">`web_search` combines AI answers with Tavily and Firecrawl,</text>
+    <text x="148" y="414" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">supports follow-up expansion, and keeps source metadata.</text>
+  </g>
+
+  <g>
+    <rect x="864" y="268" width="72" height="72" rx="20" fill="url(#green)"/>
+    <text x="962" y="314" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="800">Evidence and Auditability</text>
+    <text x="864" y="378" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">`get_sources` returns sources, search traces, and evidence</text>
+    <text x="864" y="414" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">bindings so answers can be inspected after the search.</text>
+  </g>
+
+  <g>
+    <rect x="148" y="548" width="72" height="72" rx="20" fill="url(#amber)"/>
+    <text x="246" y="594" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="800">Fetch, Map, and Fallbacks</text>
+    <text x="148" y="658" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">`web_fetch` uses Tavily Extract first and can fall back to</text>
+    <text x="148" y="694" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">Firecrawl Scrape. `web_map` helps explore site structure.</text>
+  </g>
+
+  <g>
+    <rect x="864" y="548" width="72" height="72" rx="20" fill="url(#violet)"/>
+    <text x="962" y="594" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="800">Planning and Multi-Client Use</text>
+    <text x="864" y="658" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">The `plan_*` tools structure complex research workflows, and</text>
+    <text x="864" y="694" fill="#475569" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">the server is validated with Codex, Claude, and Gemini.</text>
+  </g>
+</svg>
