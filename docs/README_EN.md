@@ -35,7 +35,6 @@ It provides:
 - Current maintainer and publisher: `ysjzy123`
 - Upstream project and original author: [`GuDaStudio/GrokSearch`](https://github.com/GuDaStudio/GrokSearch/tree/grok-with-tavily), branch `grok-with-tavily`, author `GuDaStudio`
 - Maintenance note: this repository continues from the upstream project as a separately maintained and released repository
-- Detailed attribution: [AUTHORS.md](../AUTHORS.md)
 
 ## Why This Version
 

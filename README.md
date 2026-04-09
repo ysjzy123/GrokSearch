@@ -33,7 +33,6 @@
 - 当前维护与发布：`ysjzy123`
 - 上游项目与原始作者：[`GuDaStudio/GrokSearch`](https://github.com/GuDaStudio/GrokSearch/tree/grok-with-tavily) 的 `grok-with-tavily` 分支，作者 `GuDaStudio`
 - 维护说明：本仓库是在上游基础上继续整理、修复和发布的独立仓库
-- 详细署名见：[AUTHORS.md](./AUTHORS.md)
 
 ## 为什么是这版
 
