@@ -7,11 +7,10 @@ class Config:
     _SETUP_COMMAND = (
         'claude mcp add-json grok-search --scope user '
         '\'{"type":"stdio","command":"uvx","args":["--from",'
-        '"git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily","grok-search"],'
-        '"env":{"GUDA_API_KEY":"your-guda-api-key"}}\''
+        '"git+https://github.com/ysjzy123/GrokSearch@grok-with-tavily","grok-search"],'
+        '"env":{"GROK_API_URL":"https://your-grok-endpoint/v1","GROK_API_KEY":"your-grok-api-key"}}\''
     )
-    _DEFAULT_MODEL = "grok-4.1-fast"
-    _DEFAULT_GUDA_BASE_URL = "https://code.guda.studio"
+    _DEFAULT_MODEL = "grok-4.20-fast"
 
     def __new__(cls):
         if cls._instance is None:
@@ -65,19 +64,9 @@ class Config:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
 
     @property
-    def guda_base_url(self) -> str:
-        return os.getenv("GUDA_BASE_URL", self._DEFAULT_GUDA_BASE_URL)
-
-    @property
-    def guda_api_key(self) -> str | None:
-        return os.getenv("GUDA_API_KEY")
-
-    @property
     def grok_api_url(self) -> str:
         url = os.getenv("GROK_API_URL")
         if not url:
-            if self.guda_api_key:
-                return f"{self.guda_base_url}/grok/v1"
             raise ValueError(
                 f"Grok API URL 未配置！\n"
                 f"请使用以下命令配置 MCP 服务器：\n{self._SETUP_COMMAND}"
@@ -86,7 +75,7 @@ class Config:
 
     @property
     def grok_api_key(self) -> str:
-        key = os.getenv("GROK_API_KEY") or self.guda_api_key
+        key = os.getenv("GROK_API_KEY")
         if not key:
             raise ValueError(
                 f"Grok API Key 未配置！\n"
@@ -101,24 +90,20 @@ class Config:
     @property
     def tavily_api_url(self) -> str:
         url = os.getenv("TAVILY_API_URL")
-        if not url and self.guda_api_key:
-            return f"{self.guda_base_url}/tavily"
         return url or "https://api.tavily.com"
 
     @property
     def tavily_api_key(self) -> str | None:
-        return os.getenv("TAVILY_API_KEY") or self.guda_api_key
+        return os.getenv("TAVILY_API_KEY")
 
     @property
     def firecrawl_api_url(self) -> str:
         url = os.getenv("FIRECRAWL_API_URL")
-        if not url and self.guda_api_key:
-            return f"{self.guda_base_url}/firecrawl"
         return url or "https://api.firecrawl.dev/v2"
 
     @property
     def firecrawl_api_key(self) -> str | None:
-        return os.getenv("FIRECRAWL_API_KEY") or self.guda_api_key
+        return os.getenv("FIRECRAWL_API_KEY")
 
     @property
     def log_level(self) -> str:
@@ -204,8 +189,6 @@ class Config:
             config_status = f"❌ 配置错误: {str(e)}"
 
         info = {
-            "GUDA_BASE_URL": self.guda_base_url,
-            "GUDA_API_KEY": self._mask_api_key(self.guda_api_key) if self.guda_api_key else "未配置",
             "GROK_API_URL": api_url,
             "GROK_API_KEY": api_key_masked,
             "GROK_MODEL": self.grok_model,

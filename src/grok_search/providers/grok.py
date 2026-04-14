@@ -6,7 +6,7 @@ from typing import Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from .base import BaseSearchProvider
-from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
+from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt, sources_synthesis_prompt
 from ..logger import log_info
 from ..config import config
 
@@ -131,7 +131,7 @@ class _WaitWithRetryAfter(wait_base):
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(self, api_url: str, api_key: str, model: str = "grok-4.20-fast"):
         super().__init__(api_url, api_key)
         self.model = model
 
@@ -166,7 +166,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_with_fallback(headers, payload, ctx)
+        return await self._execute_stream_with_retry(headers, payload, ctx)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -344,3 +344,18 @@ class GrokSearchProvider(BaseSearchProvider):
             if i not in seen:
                 order.append(i)
         return order
+
+    async def synthesize_from_sources(self, query: str, sources_text: str, ctx=None) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": sources_synthesis_prompt},
+                {"role": "user", "content": f"Query: {query}\n\nSources:\n{sources_text}"},
+            ],
+            "stream": False,
+        }
+        return await self._execute_json_with_retry(headers, payload, ctx)

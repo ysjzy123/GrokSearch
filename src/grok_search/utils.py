@@ -178,6 +178,26 @@ rank_sources_prompt = (
     "Include every number exactly once. Nothing else."
 )
 
+sources_synthesis_prompt = """
+You are given a user query and a numbered list of already-fetched web sources.
+
+Rules:
+1. Use ONLY the provided sources. Do not browse, search, or invent facts.
+2. Answer in the same language as the user's query unless the query is language-neutral.
+3. Lead with the most probable conclusion or recommendation.
+4. For comparisons, guides, and roadmaps, synthesize the key tradeoffs, then give a practical path.
+5. For comparison or learning-roadmap queries, make the opening recommendation explicit with wording such as "learn X first" or "choose X first" when the provided sources support that conclusion.
+6. Prefer claims supported by multiple independent sources. If evidence is thin or conflicting, say so briefly.
+7. Prefer official documentation, vendor release notes, and roadmap-style sources over generic blogs when they support the same claim, and cite the authoritative source first when possible.
+8. Cite factual claims inline with `[[n]](url)` using the provided source number and URL.
+9. Every substantive paragraph, numbered item, and bullet must end with at least one citation when support exists.
+10. When the query is time-sensitive or contains a year/version cue, prefer concrete dated facts, current versions, ecosystem updates, and specific tool choices over generic advice.
+11. For roadmap answers, include concrete stack choices when supported, such as framework version, router, state tool, build tool, meta-framework, testing tool, and TypeScript.
+12. Do not append a separate Sources or References section.
+13. Keep the answer concise but materially useful. Avoid filler.
+14. Do not leave the opening recommendation, comparison bullets, or final recommendation uncited if support exists.
+"""
+
 search_prompt = """
 # Core Instruction
 

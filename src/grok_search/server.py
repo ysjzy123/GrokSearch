@@ -57,13 +57,152 @@ _AVAILABLE_MODELS_LOCK = asyncio.Lock()
 _ASCII_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+#.\-]{1,}")
 _CJK_SEGMENT_PATTERN = re.compile(r"[\u4e00-\u9fff]+")
 _CLAIM_SPLIT_PATTERN = re.compile(r"(?<=[。！？.!?;；])\s+")
+_INLINE_CITATION_URL_PATTERN = re.compile(r"\[\[\d+\]\]\((https?://[^)]+)\)")
 _MAX_PLANNED_QUERIES = 3
 _INITIAL_EXTRA_SOURCE_BUDGET_CAP = 6
 _MIN_SOURCES_FOR_EARLY_STOP = 4
 _MIN_DOMAIN_COUNT_FOR_EARLY_STOP = 2
+_MIN_SOURCES_FOR_EARLY_STOP_COMPLEX = 6
+_MIN_DOMAIN_COUNT_FOR_EARLY_STOP_COMPLEX = 4
+_MIN_SUPPORTED_CLAIMS_FOR_EARLY_STOP_COMPLEX = 3
 _MAX_ENRICHABLE_SOURCES = 2
+_MAX_RANKABLE_SOURCES = 8
+_FAST_MODEL_SUFFIX = "-fast"
+_AUTO_MODEL_SUFFIX = "-auto"
+_MIN_SOURCES_FOR_RANKING = 6
+_MAX_FOLLOWUP_QUERIES_FOR_MULTIFACET = 2
+_MAX_EXPANSION_EXTRA_SOURCE_BUDGET = 6
+_EXTERNAL_SEARCH_TIMEOUT_SECONDS = 8.0
+_EXPANSION_EXTERNAL_SEARCH_TIMEOUT_SECONDS = 6.0
+_RELAXED_EXTERNAL_SEARCH_TIMEOUT_SECONDS = 4.0
 _SOURCE_ENRICH_TIMEOUT_SECONDS = 8.0
 _SOURCE_RANK_TIMEOUT_SECONDS = 4.0
+_SOURCE_SYNTHESIS_TIMEOUT_SECONDS = 18.0
+_MAX_SYNTHESIS_SOURCES = 8
+_AUTHORITATIVE_SOURCE_DOMAINS = {
+    "fastapi.tiangolo.com",
+    "react.dev",
+    "vuejs.org",
+    "roadmap.sh",
+    "nextjs.org",
+    "nuxt.com",
+    "vite.dev",
+    "vitejs.dev",
+    "docs.python.org",
+    "wikipedia.org",
+    "fastapi-tutorial.readthedocs.io",
+}
+_ENGLISH_COMPARISON_SEPARATORS = (" vs ", " versus ")
+_LEARNING_QUERY_KEYWORDS = ("learn", "learning", "guide", "tutorial", "roadmap")
+_TIME_SENSITIVE_QUERY_KEYWORDS = ("latest", "current", "stable", "version", "versions", "release")
+_SUBJECT_EXTRACTION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "architecture",
+    "best",
+    "between",
+    "choose",
+    "compare",
+    "comparison",
+    "current",
+    "docs",
+    "for",
+    "guide",
+    "how",
+    "i",
+    "in",
+    "learn",
+    "learning",
+    "latest",
+    "official",
+    "or",
+    "pick",
+    "practices",
+    "release",
+    "roadmap",
+    "should",
+    "stable",
+    "the",
+    "to",
+    "tutorial",
+    "version",
+    "versions",
+    "versus",
+    "vs",
+    "what",
+    "which",
+    "with",
+}
+_SUBJECT_QUERY_HINTS: dict[str, dict[str, list[str] | str]] = {
+    "react": {
+        "label": "React 19",
+        "domain": "react.dev",
+        "extras": ["learn", "official guide", "Next.js", "TypeScript", "Vite"],
+    },
+    "vue": {
+        "label": "Vue 3",
+        "domain": "vuejs.org",
+        "extras": ["guide", "official docs", "Nuxt", "TypeScript", "Vite"],
+    },
+    "next.js": {
+        "label": "Next.js",
+        "domain": "nextjs.org",
+        "extras": ["App Router", "official docs", "TypeScript", "release notes"],
+    },
+    "nextjs": {
+        "label": "Next.js",
+        "domain": "nextjs.org",
+        "extras": ["App Router", "official docs", "TypeScript", "release notes"],
+    },
+    "nuxt": {
+        "label": "Nuxt",
+        "domain": "nuxt.com",
+        "extras": ["Vue 3", "official docs", "TypeScript", "release notes"],
+    },
+}
+
+
+def _source_authority_score(source: dict) -> float:
+    url = (source.get("url") or "").strip()
+    domain = urlparse(url).netloc.lower()
+    if not domain:
+        return 0.0
+    if any(domain == item or domain.endswith(f".{item}") for item in _AUTHORITATIVE_SOURCE_DOMAINS):
+        return 2.0
+    if domain.endswith('.readthedocs.io') or domain.startswith('docs.'):
+        return 1.2
+    if domain.endswith('.org'):
+        return 0.6
+    return 0.0
+
+
+def _source_text_blob(source: dict) -> str:
+    return " ".join(
+        str(source.get(key) or "")
+        for key in ("title", "description", "url", "query_used")
+    ).lower()
+
+
+def _source_contains_keywords(source: dict, keywords: list[str]) -> bool:
+    haystack = _source_text_blob(source)
+    return any(keyword.lower() in haystack for keyword in keywords)
+
+
+def _sources_from_inline_citations(answer: str) -> list[dict]:
+    seen: set[str] = set()
+    sources: list[dict] = []
+    for url in _INLINE_CITATION_URL_PATTERN.findall(answer or ""):
+        normalized = url.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        sources.append({
+            "url": normalized,
+            "title": normalized,
+            "provider": "grok",
+        })
+    return sources
 
 
 async def _fetch_available_models(api_url: str, api_key: str) -> list[str]:
@@ -206,33 +345,342 @@ def _should_expand_search_query(query: str, extra_sources: int) -> bool:
     return any(keyword in query_lower or keyword in query for keyword in keywords)
 
 
+def _is_multifacet_search_query(query: str) -> bool:
+    query_lower = query.lower()
+    keywords = [
+        " vs ",
+        "versus",
+        "compare",
+        "comparison",
+        "tradeoff",
+        "tradeoffs",
+        "learn",
+        "learning",
+        "guide",
+        "tutorial",
+        "roadmap",
+        "best practices",
+        "alternatives",
+        "学习",
+        "教程",
+        "入门",
+        "路线",
+        "指南",
+        "最佳实践",
+        "对比",
+        "区别",
+        "优缺点",
+        "替代",
+    ]
+    return any(keyword in query_lower or keyword in query for keyword in keywords)
+
+
+def _is_learning_search_query(query: str) -> bool:
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in _LEARNING_QUERY_KEYWORDS) or any(
+        keyword in query for keyword in ["学习", "教程", "入门", "路线", "指南"]
+    )
+
+
+def _is_time_sensitive_search_query(query: str) -> bool:
+    query_lower = query.lower()
+    if re.search(r"\b20\d{2}\b", query_lower):
+        return True
+    return any(keyword in query_lower for keyword in _TIME_SENSITIVE_QUERY_KEYWORDS) or any(
+        keyword in query for keyword in ["最新", "版本", "今年", "现在", "发布"]
+    )
+
+
+def _preferred_analysis_model(base_model: str) -> str:
+    normalized = (base_model or "").strip()
+    if not normalized:
+        return normalized
+    suffix = ""
+    if normalized.endswith(":online"):
+        normalized, suffix = normalized[:-7], ":online"
+    if normalized.endswith(_AUTO_MODEL_SUFFIX):
+        return normalized + suffix
+    if normalized.endswith(_FAST_MODEL_SUFFIX):
+        return normalized[: -len(_FAST_MODEL_SUFFIX)] + _AUTO_MODEL_SUFFIX + suffix
+    return normalized + suffix
+
+
+def _should_use_analysis_model(
+    query: str,
+    *,
+    prefer_source_synthesis: bool,
+    planned_queries: list[str],
+) -> bool:
+    if prefer_source_synthesis:
+        return True
+    if len(planned_queries) > 1:
+        return True
+    return _is_multifacet_search_query(query) or _is_learning_search_query(query)
+
+
+async def _resolve_stage_models(
+    api_url: str,
+    api_key: str,
+    base_model: str,
+    *,
+    query: str,
+    prefer_source_synthesis: bool,
+    planned_queries: list[str],
+) -> dict[str, str]:
+    models = {"search": base_model, "analysis": base_model}
+    candidate_analysis_model = _preferred_analysis_model(base_model)
+    if candidate_analysis_model == base_model:
+        return models
+    if not _should_use_analysis_model(
+        query,
+        prefer_source_synthesis=prefer_source_synthesis,
+        planned_queries=planned_queries,
+    ):
+        return models
+    available = await _get_available_models_cached(api_url, api_key)
+    if not available or candidate_analysis_model in available:
+        models["analysis"] = candidate_analysis_model
+    return models
+
+
+def _extract_ascii_subject_segment(text: str, *, from_end: bool) -> str:
+    tokens = _ASCII_TOKEN_PATTERN.findall(text)
+    if not tokens:
+        return ""
+
+    ordered = list(reversed(tokens)) if from_end else tokens
+    selected: list[str] = []
+    for token in ordered:
+        token_lower = token.casefold()
+        if re.fullmatch(r"20\d{2}", token):
+            if selected:
+                break
+            continue
+        if token_lower in _SUBJECT_EXTRACTION_STOPWORDS:
+            if selected:
+                break
+            continue
+        selected.append(token)
+        if len(selected) >= 3:
+            break
+
+    if not selected:
+        return ""
+    if from_end:
+        selected.reverse()
+    return " ".join(selected)
+
+
+def _extract_comparison_subjects(query: str) -> tuple[str, str] | None:
+    normalized = " ".join((query or "").split())
+    query_lower = normalized.lower()
+    for separator in _ENGLISH_COMPARISON_SEPARATORS:
+        index = query_lower.find(separator)
+        if index == -1:
+            continue
+        left = _extract_ascii_subject_segment(normalized[:index], from_end=True)
+        right = _extract_ascii_subject_segment(
+            normalized[index + len(separator):],
+            from_end=False,
+        )
+        if left and right and left.casefold() != right.casefold():
+            return left, right
+    return None
+
+
+def _subject_focus_terms(hint: dict[str, list[str] | str], *, learning: bool) -> tuple[str, str]:
+    extras = [str(item).strip() for item in hint.get("extras", []) if str(item).strip()]
+    guide_term = ""
+    ecosystem_term = ""
+    for item in extras:
+        lowered = item.casefold()
+        if not guide_term and any(keyword in lowered for keyword in ["learn", "guide", "docs", "tutorial"]):
+            guide_term = item
+            continue
+        if lowered in {"typescript", "vite", "official docs", "official guide", "release notes"}:
+            continue
+        if not ecosystem_term:
+            ecosystem_term = item
+    if not learning:
+        guide_term = ""
+    return guide_term, ecosystem_term
+
+
+def _build_subject_focus_query(subject: str, *, learning: bool, time_sensitive: bool) -> str:
+    normalized = subject.strip()
+    hint = _SUBJECT_QUERY_HINTS.get(normalized.casefold())
+
+    if hint:
+        guide_term, ecosystem_term = _subject_focus_terms(hint, learning=learning)
+        parts = [str(hint["label"]), str(hint["domain"]), "official docs"]
+        if guide_term:
+            parts.append(guide_term)
+        if time_sensitive:
+            parts.append("current version")
+        if ecosystem_term:
+            parts.append(ecosystem_term)
+        return " ".join(parts)
+
+    parts = [normalized, "official docs"]
+    if learning:
+        parts.append("guide")
+    if time_sensitive:
+        parts.append("current version")
+    return " ".join(parts)
+
+
+def _build_relaxed_search_query(query: str) -> str:
+    normalized = " ".join((query or "").split()).strip()
+    if not normalized:
+        return ""
+
+    lowered = normalized.casefold()
+    for key, hint in _SUBJECT_QUERY_HINTS.items():
+        label = str(hint.get("label") or "").strip()
+        domain = str(hint.get("domain") or "").strip()
+        candidates = [key.casefold(), label.casefold(), domain.casefold()]
+        if any(candidate and candidate in lowered for candidate in candidates):
+            return " ".join(part for part in [label or key, domain, "official docs"] if part)
+
+    if _contains_cjk(normalized):
+        if "官方文档" in normalized:
+            return normalized.split("官方文档", 1)[0].strip() + " 官方文档"
+        return normalized
+
+    noise = {
+        "learning",
+        "roadmap",
+        "guide",
+        "tutorial",
+        "current",
+        "version",
+        "versions",
+        "official",
+        "docs",
+        "learn",
+        "typescript",
+        "vite",
+        "benchmarks",
+        "ecosystem",
+        "release",
+        "notes",
+        "stable",
+    }
+    filtered = [token for token in normalized.split() if token.casefold() not in noise]
+    if not filtered:
+        return normalized
+    return " ".join(filtered[:5] + (["official", "docs"] if "official docs" in lowered else []))
+
+
 def _build_search_queries(query: str, extra_sources: int) -> list[str]:
     base = query.strip()
     if not _should_expand_search_query(base, extra_sources):
         return [base]
 
-    if _contains_cjk(base):
-        query_lower = base.lower()
-        if any(keyword in query_lower or keyword in base for keyword in ["对比", "区别", "选哪个"]):
-            return _dedupe_queries([base, f"{base} 性能对比", f"{base} 优缺点"])
-        if any(keyword in query_lower or keyword in base for keyword in ["学习", "入门", "教程", "路线", "指南"]):
-            return _dedupe_queries([base, f"{base} 学习路线", f"{base} 最佳实践"])
-        return _dedupe_queries([base, f"{base} 官方文档", f"{base} 实战经验"])
-
     query_lower = base.lower()
+    is_learning_query = _is_learning_search_query(base)
+    is_time_sensitive_query = _is_time_sensitive_search_query(base)
+    comparison_subjects = _extract_comparison_subjects(base)
+    if comparison_subjects and is_learning_query:
+        left_subject, right_subject = comparison_subjects
+        return _dedupe_queries(
+            [
+                base,
+                _build_subject_focus_query(
+                    left_subject,
+                    learning=True,
+                    time_sensitive=is_time_sensitive_query,
+                ),
+                _build_subject_focus_query(
+                    right_subject,
+                    learning=True,
+                    time_sensitive=is_time_sensitive_query,
+                ),
+            ]
+        )[:_MAX_PLANNED_QUERIES]
+
+    if _contains_cjk(base):
+        if any(keyword in query_lower or keyword in base for keyword in ["对比", "区别", "选哪个"]):
+            return _dedupe_queries([base, f"{base} 官方文档", f"{base} 性能对比"])
+        if any(keyword in query_lower or keyword in base for keyword in ["学习", "入门", "教程", "路线", "指南"]):
+            return _dedupe_queries([base, f"{base} 官方文档", f"{base} 学习路线"])
+        return _dedupe_queries([base, f"{base} 官方文档", f"{base} 最新版本"])
+
     if any(keyword in query_lower for keyword in [" vs ", "versus", "compare", "comparison"]):
-        return _dedupe_queries([base, f"{base} benchmarks", f"{base} tradeoffs"])[:_MAX_PLANNED_QUERIES]
+        return _dedupe_queries([base, f"{base} official docs", f"{base} benchmarks"])[:_MAX_PLANNED_QUERIES]
     if any(keyword in query_lower for keyword in ["learn", "learning", "guide", "tutorial", "roadmap"]):
-        return _dedupe_queries([base, f"{base} roadmap", f"{base} best practices"])[:_MAX_PLANNED_QUERIES]
-    return _dedupe_queries([base, f"{base} official docs", f"{base} alternatives"])[:_MAX_PLANNED_QUERIES]
+        return _dedupe_queries([base, f"{base} official docs", f"{base} roadmap current versions"])[:_MAX_PLANNED_QUERIES]
+    return _dedupe_queries([base, f"{base} official docs", f"{base} current version ecosystem"])[:_MAX_PLANNED_QUERIES]
+
+
+def _local_source_priority_score(query: str, source: dict) -> float:
+    url = (source.get("url") or "").strip().lower()
+    domain = urlparse(url).netloc.lower()
+    query_used = " ".join((source.get("query_used") or "").split()).strip().casefold()
+    base_query = " ".join((query or "").split()).strip().casefold()
+
+    score = _source_authority_score(source) * 3.0
+    if query_used and query_used != base_query:
+        score += 0.8
+
+    if _is_multifacet_search_query(query) and _source_contains_keywords(source, ["roadmap", "guide", "official docs"]):
+        score += 0.9
+
+    if _is_time_sensitive_search_query(query) and _source_contains_keywords(
+        source,
+        ["release", "current version", "stable", "2026", "react 19", "vue 3", "next.js", "nuxt", "vite", "typescript"],
+    ):
+        score += 0.75
+
+    if domain == "roadmap.sh":
+        score += 1.4
+    if any(domain == item or domain.endswith(f".{item}") for item in ["react.dev", "vuejs.org", "nextjs.org", "nuxt.com", "vite.dev", "vitejs.dev"]):
+        score += 1.8
+
+    if domain == "medium.com" or domain.endswith('.medium.com'):
+        score -= 0.2
+    elif domain.startswith('blog.') or '/blog/' in url:
+        score -= 0.1
+
+    source_score = source.get("score")
+    if isinstance(source_score, (int, float)):
+        score += min(float(source_score), 1.0) * 0.3
+
+    return score
+
+
+def _should_prioritize_sources_locally(query: str, sources: list[dict]) -> bool:
+    return len(sources) > 1 and (_is_multifacet_search_query(query) or _is_time_sensitive_search_query(query))
+
+
+def _prioritize_sources_locally(query: str, sources: list[dict]) -> tuple[list[dict], bool]:
+    if not _should_prioritize_sources_locally(query, sources):
+        return sources, False
+
+    base_query = " ".join((query or "").split()).strip().casefold()
+    ordered = sorted(
+        sources,
+        key=lambda source: (
+            _local_source_priority_score(query, source),
+            (" ".join((source.get("query_used") or "").split()).strip().casefold() != base_query),
+            len(source.get("description") or ""),
+        ),
+        reverse=True,
+    )
+    changed = [item.get("url") for item in ordered] != [item.get("url") for item in sources]
+    return ordered, changed
 
 
 def _select_initial_extra_source_budget(extra_sources: int, planned_queries: list[str]) -> int:
     if extra_sources <= 0:
         return 0
-    if len(planned_queries) <= 1:
-        return extra_sources
     return min(extra_sources, _INITIAL_EXTRA_SOURCE_BUDGET_CAP)
+
+
+def _select_expansion_extra_source_budget(query: str, remaining_budget: int, followup_queries: list[str]) -> int:
+    if remaining_budget <= 0 or not followup_queries:
+        return 0
+    return min(remaining_budget, _MAX_EXPANSION_EXTRA_SOURCE_BUDGET)
 
 
 def _allocate_query_budgets(total: int, query_count: int) -> list[int]:
@@ -269,6 +717,7 @@ def _build_search_trace(
     used_budget: int = 0,
     phases: list[dict] | None = None,
     decision: dict[str, Any] | None = None,
+    postprocessing: dict[str, Any] | None = None,
 ) -> dict:
     provider_counts = Counter(
         record.get("provider")
@@ -280,19 +729,25 @@ def _build_search_trace(
         for record in executed_queries
         if isinstance(record, dict) and record.get("query")
     }
+    followup_executed = any(
+        isinstance(record, dict) and record.get("phase") == "expansion"
+        for record in executed_queries
+    )
     return {
         "root_query": root_query,
         "planned_queries": planned_queries,
         "executed_queries": executed_queries,
         "phases": phases or [],
         "decision": decision or {},
+        "postprocessing": postprocessing or {},
         "summary": {
             "planned_query_count": len(planned_queries),
             "executed_query_count": len(executed_query_values),
             "provider_counts": dict(provider_counts),
             "sources_count": len(sources),
             "domain_count": len(_source_domains(sources)),
-            "expanded": len(planned_queries) > 1,
+            "expanded": followup_executed,
+            "planned_expansion": len(planned_queries) > 1,
             "external_task_count": sum(
                 1
                 for record in executed_queries
@@ -303,10 +758,7 @@ def _build_search_trace(
             "budget_unused": max(requested_budget - used_budget, 0),
             "early_stopped": bool(decision and decision.get("early_stopped")),
             "stop_reason": (decision or {}).get("reason", ""),
-            "followup_executed": any(
-                isinstance(record, dict) and record.get("phase") == "expansion"
-                for record in executed_queries
-            ),
+            "followup_executed": followup_executed,
         },
     }
 
@@ -338,10 +790,13 @@ def _normalize_cached_search_payload(payload: Any) -> dict:
 def _normalize_claim_text(text: str) -> str:
     cleaned = re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", (text or "").strip())
     cleaned = re.sub(r"^\s*#+\s*", "", cleaned)
+    cleaned = re.sub(r"\[\[\d+\]\]\(https?://[^)]+\)", "", cleaned)
+    cleaned = re.sub(r"[*_`]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
 
-def _extract_claims(answer: str, max_claims: int = 5) -> list[str]:
+def _extract_claims(answer: str, max_claims: int = 12) -> list[str]:
     lines = [_normalize_claim_text(line) for line in (answer or "").splitlines()]
     claims = [line for line in lines if len(line) >= 12]
 
@@ -463,7 +918,8 @@ def _build_evidence_bindings(answer: str, sources: list[dict]) -> list[dict]:
             title_bonus = sum(token_weights.get(token, 1.0) for token in title_overlap) * 0.5
             phrase_bonus = sum(0.75 for phrase in claim_phrases if phrase in normalized_text)
             exact_claim_bonus = 1.0 if " ".join(claim.lower().split()) in normalized_text else 0.0
-            score = float(weighted_overlap + title_bonus + phrase_bonus + exact_claim_bonus)
+            authority_bonus = _source_authority_score(source)
+            score = float(weighted_overlap + title_bonus + phrase_bonus + exact_claim_bonus + authority_bonus)
             ranked.append((score, source, sorted(overlap)[:6]))
 
         ranked.sort(
@@ -498,6 +954,75 @@ def _build_evidence_bindings(answer: str, sources: list[dict]) -> list[dict]:
     return bindings
 
 
+def _format_binding_citations(binding_sources: list[dict], sources: list[dict]) -> str:
+    url_to_index = {
+        (source.get("url") or "").strip(): idx
+        for idx, source in enumerate(sources, 1)
+        if (source.get("url") or "").strip()
+    }
+    ranked_sources = sorted(
+        binding_sources,
+        key=lambda item: (
+            _source_authority_score(item),
+            float(item.get("score") or 0.0),
+            item.get("provider") == "tavily",
+        ),
+        reverse=True,
+    )
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in ranked_sources[:2]:
+        url = (item.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        index = url_to_index.get(url)
+        if index is not None:
+            parts.append(f"[[{index}]]({url})")
+    return " ".join(parts)
+
+
+def _attach_evidence_citations(answer: str, sources: list[dict]) -> tuple[str, list[dict]]:
+    bindings = _build_evidence_bindings(answer, sources)
+    if not answer or not bindings:
+        return answer, bindings
+
+    claim_to_citations: dict[str, str] = {}
+    for binding in bindings:
+        claim = _normalize_claim_text(binding.get("claim") or "")
+        citations = _format_binding_citations(binding.get("sources") or [], sources)
+        if claim and citations:
+            claim_to_citations[claim.casefold()] = citations
+
+    if not claim_to_citations:
+        return answer, bindings
+
+    rendered: list[str] = []
+    in_code_block = False
+    updated = False
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            rendered.append(line)
+            continue
+        if in_code_block or not stripped or "[[" in line:
+            rendered.append(line)
+            continue
+
+        normalized = _normalize_claim_text(line)
+        citations = claim_to_citations.get(normalized.casefold())
+        if citations:
+            rendered.append(f"{line} {citations}")
+            updated = True
+        else:
+            rendered.append(line)
+
+    if updated:
+        return "\n".join(rendered), _build_evidence_bindings("\n".join(rendered), sources)
+    return answer, bindings
+
+
 def _summarize_source_support(answer: str, sources: list[dict]) -> dict[str, int]:
     claims = _extract_claims(answer)
     bindings = _build_evidence_bindings(answer, sources)
@@ -511,6 +1036,7 @@ def _summarize_source_support(answer: str, sources: list[dict]) -> dict[str, int
 
 
 def _should_expand_after_initial(
+    query: str,
     answer: str,
     sources: list[dict],
     followup_queries: list[str],
@@ -525,12 +1051,21 @@ def _should_expand_after_initial(
     if not followup_queries:
         return False, support, "single_query_plan"
 
-    enough_sources = support["sources_count"] >= _MIN_SOURCES_FOR_EARLY_STOP
-    enough_domains = support["domain_count"] >= _MIN_DOMAIN_COUNT_FOR_EARLY_STOP
-    enough_claims = (
-        support["claim_count"] == 0
-        or support["supported_claims"] >= min(support["claim_count"], 2)
-    )
+    if _is_multifacet_search_query(query):
+        enough_sources = support["sources_count"] >= _MIN_SOURCES_FOR_EARLY_STOP_COMPLEX
+        enough_domains = support["domain_count"] >= _MIN_DOMAIN_COUNT_FOR_EARLY_STOP_COMPLEX
+        enough_claims = (
+            support["claim_count"] == 0
+            or support["supported_claims"]
+            >= min(support["claim_count"], _MIN_SUPPORTED_CLAIMS_FOR_EARLY_STOP_COMPLEX)
+        )
+    else:
+        enough_sources = support["sources_count"] >= _MIN_SOURCES_FOR_EARLY_STOP
+        enough_domains = support["domain_count"] >= _MIN_DOMAIN_COUNT_FOR_EARLY_STOP
+        enough_claims = (
+            support["claim_count"] == 0
+            or support["supported_claims"] >= min(support["claim_count"], 2)
+        )
     if enough_sources and enough_domains and enough_claims:
         return False, support, "initial_support_sufficient"
     return True, support, "initial_support_insufficient"
@@ -554,6 +1089,89 @@ async def _safe_firecrawl_search(search_query: str, count: int) -> list[dict] | 
     return None
 
 
+def _external_search_timeout(phase: str, *, relaxed: bool = False) -> float:
+    if relaxed:
+        return _RELAXED_EXTERNAL_SEARCH_TIMEOUT_SECONDS
+    if phase == "expansion":
+        return _EXPANSION_EXTERNAL_SEARCH_TIMEOUT_SECONDS
+    return _EXTERNAL_SEARCH_TIMEOUT_SECONDS
+
+
+async def _run_external_search_specs(
+    task_specs: list[dict[str, Any]],
+    *,
+    phase: str,
+    relaxed: bool = False,
+) -> list[tuple[dict[str, Any], list[dict] | None]]:
+    coros: list[Any] = []
+    active_specs: list[dict[str, Any]] = []
+    timeout_seconds = _external_search_timeout(phase, relaxed=relaxed)
+
+    for spec in task_specs:
+        provider = spec.get("provider")
+        search_query = str(spec.get("query") or "").strip()
+        count = int(spec.get("requested") or 0)
+        if not search_query or count <= 0:
+            continue
+        active_specs.append(spec)
+        if provider == "tavily":
+            coros.append(asyncio.wait_for(_safe_tavily_search(search_query, count), timeout=timeout_seconds))
+        else:
+            coros.append(asyncio.wait_for(_safe_firecrawl_search(search_query, count), timeout=timeout_seconds))
+
+    if not coros:
+        return []
+
+    gathered = await asyncio.gather(*coros, return_exceptions=True)
+    results: list[tuple[dict[str, Any], list[dict] | None]] = []
+    for spec, result in zip(active_specs, gathered):
+        if isinstance(result, asyncio.TimeoutError):
+            result_list = None
+        else:
+            result_list = result if isinstance(result, list) else None
+        results.append((spec, result_list))
+    return results
+
+
+async def _retry_zero_result_queries(
+    task_results: list[tuple[dict[str, Any], list[dict] | None]],
+    *,
+    phase: str,
+) -> list[tuple[dict[str, Any], list[dict] | None]]:
+    if phase != "expansion" or not task_results:
+        return task_results
+
+    grouped: dict[str, list[int]] = {}
+    for index, (spec, _result_list) in enumerate(task_results):
+        grouped.setdefault(str(spec.get("query") or ""), []).append(index)
+
+    relaxed_specs: list[dict[str, Any]] = []
+    relaxed_targets: list[int] = []
+    for original_query, indexes in grouped.items():
+        total_results = sum(len(task_results[index][1] or []) for index in indexes)
+        if total_results > 0:
+            continue
+        relaxed_query = _build_relaxed_search_query(original_query)
+        if not relaxed_query or relaxed_query.casefold() == original_query.casefold():
+            continue
+        for index in indexes:
+            spec, _result_list = task_results[index]
+            relaxed_specs.append({**spec, "query": relaxed_query, "fallback_from": original_query})
+            relaxed_targets.append(index)
+
+    if not relaxed_specs:
+        return task_results
+
+    rerun_results = await _run_external_search_specs(relaxed_specs, phase=phase, relaxed=True)
+    if not rerun_results:
+        return task_results
+
+    updated = list(task_results)
+    for target_index, rerun in zip(relaxed_targets, rerun_results):
+        updated[target_index] = rerun
+    return updated
+
+
 async def _run_external_search_batch(
     queries: list[str],
     tavily_total: int,
@@ -561,7 +1179,6 @@ async def _run_external_search_batch(
     *,
     phase: str,
 ) -> tuple[list[dict], list[list[dict]], list[list[dict]], int]:
-    coros: list[Any] = []
     task_specs: list[dict[str, Any]] = []
     tavily_budgets = _allocate_query_budgets(tavily_total, len(queries))
     firecrawl_budgets = _allocate_query_budgets(firecrawl_total, len(queries))
@@ -572,7 +1189,6 @@ async def _run_external_search_batch(
         task_specs.append(
             {"provider": "tavily", "query": search_query, "requested": count, "phase": phase}
         )
-        coros.append(_safe_tavily_search(search_query, count))
 
     for search_query, count in zip(queries, firecrawl_budgets):
         if count <= 0:
@@ -580,29 +1196,30 @@ async def _run_external_search_batch(
         task_specs.append(
             {"provider": "firecrawl", "query": search_query, "requested": count, "phase": phase}
         )
-        coros.append(_safe_firecrawl_search(search_query, count))
 
-    if not coros:
+    if not task_specs:
         return [], [], [], 0
 
-    gathered = await asyncio.gather(*coros)
+    task_results = await _run_external_search_specs(task_specs, phase=phase)
+    task_results = await _retry_zero_result_queries(task_results, phase=phase)
+
     records: list[dict] = []
     tavily_source_chunks: list[list[dict]] = []
     firecrawl_source_chunks: list[list[dict]] = []
     used_budget = 0
 
-    for spec, result in zip(task_specs, gathered):
-        result_list = result if isinstance(result, list) else None
-        used_budget += spec["requested"]
-        records.append(
-            {
-                "provider": spec["provider"],
-                "query": spec["query"],
-                "requested": spec["requested"],
-                "results_count": len(result_list or []),
-                "phase": phase,
-            }
-        )
+    for spec, result_list in task_results:
+        used_budget += int(spec["requested"])
+        record = {
+            "provider": spec["provider"],
+            "query": spec["query"],
+            "requested": spec["requested"],
+            "results_count": len(result_list or []),
+            "phase": phase,
+        }
+        if spec.get("fallback_from"):
+            record["fallback_from"] = spec["fallback_from"]
+        records.append(record)
         if spec["provider"] == "tavily":
             tavily_source_chunks.append(
                 _extra_results_to_sources(result_list, None, query_used=spec["query"])
@@ -691,11 +1308,78 @@ def _source_needs_enrichment(source: dict) -> bool:
     return (not title or title == url) and not description
 
 
+def _query_count_for_sources(root_query: str, sources: list[dict]) -> int:
+    seen: set[str] = set()
+    normalized_root = " ".join((root_query or "").split()).strip()
+    if normalized_root:
+        seen.add(normalized_root.casefold())
+
+    for source in sources:
+        query_used = " ".join(((source.get("query_used") or "")).split()).strip()
+        if query_used:
+            seen.add(query_used.casefold())
+
+    return len(seen)
+
+
+def _should_enrich_sources(query: str, sources: list[dict]) -> bool:
+    if not any(_source_needs_enrichment(source) for source in sources):
+        return False
+
+    if len(sources) <= 3:
+        return True
+
+    if _query_count_for_sources(query, sources) > 1:
+        return True
+
+    return _should_expand_search_query(query, _INITIAL_EXTRA_SOURCE_BUDGET_CAP)
+
+
+def _should_rank_sources(query: str, sources: list[dict]) -> bool:
+    if len(sources) < _MIN_SOURCES_FOR_RANKING:
+        return False
+
+    if _is_multifacet_search_query(query):
+        return False
+
+    query_count = _query_count_for_sources(query, sources)
+    if query_count > 1:
+        return True
+
+    return _should_expand_search_query(query, _INITIAL_EXTRA_SOURCE_BUDGET_CAP)
+
+
 def _truncate_text(value: str, max_len: int = 280) -> str:
     text = (value or "").strip()
     if len(text) <= max_len:
         return text
     return text[: max_len - 3].rstrip() + "..."
+
+
+def _build_sources_only_fallback_answer(query: str, sources: list[dict], *, reason: str = "") -> str:
+    if not sources:
+        return f"搜索失败: {reason}" if reason else ""
+
+    lines = ["聚合搜索已完成，但综合生成失败，以下为保底来源摘要：", ""]
+    if query:
+        lines.append(f"Query: {query}")
+        lines.append("")
+
+    for source in sources[:5]:
+        title = _truncate_text(source.get("title") or source.get("url") or "Untitled", 120)
+        description = _truncate_text(source.get("description") or "", 220)
+        url = (source.get("url") or "").strip()
+        line = f"- **{title}**"
+        if description:
+            line += f": {description}"
+        if url:
+            line += f" ({url})"
+        lines.append(line)
+
+    if reason:
+        lines.extend(["", f"降级原因: {reason}"])
+    lines.extend(["", "以上为保底结果，建议稍后重试以获取完整综合答案。"])
+    return "\n".join(lines)
 
 
 def _build_rank_sources_text(sources: list[dict]) -> str:
@@ -710,6 +1394,54 @@ def _build_rank_sources_text(sources: list[dict]) -> str:
         if description:
             lines.append(f"   Summary: {description}")
     return "\n".join(lines)
+
+
+def _build_synthesis_sources_text(sources: list[dict]) -> str:
+    lines: list[str] = []
+    for idx, source in enumerate(sources[:_MAX_SYNTHESIS_SOURCES], 1):
+        title = _truncate_text(source.get("title") or source.get("url") or "Untitled", 120)
+        url = (source.get("url") or "").strip()
+        description = _truncate_text(source.get("description") or "", 360)
+        provider = (source.get("provider") or "").strip()
+        query_used = (source.get("query_used") or "").strip()
+        lines.append(f"[{idx}] {title}")
+        if url:
+            lines.append(f"URL: {url}")
+            lines.append(f"Citation: [[{idx}]]({url})")
+        if provider:
+            lines.append(f"Provider: {provider}")
+        if query_used:
+            lines.append(f"Query Used: {query_used}")
+        if description:
+            lines.append(f"Summary: {description}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _synthesize_answer_from_sources(
+    query: str,
+    grok_provider: GrokSearchProvider,
+    sources: list[dict],
+    fallback_provider: GrokSearchProvider | None = None,
+) -> str:
+    sources_text = _build_synthesis_sources_text(sources)
+    if not sources_text.strip():
+        return ""
+    try:
+        return await asyncio.wait_for(
+            grok_provider.synthesize_from_sources(query, sources_text),
+            timeout=_SOURCE_SYNTHESIS_TIMEOUT_SECONDS,
+        )
+    except (Exception, asyncio.TimeoutError):
+        if fallback_provider and fallback_provider is not grok_provider:
+            try:
+                return await asyncio.wait_for(
+                    fallback_provider.synthesize_from_sources(query, sources_text),
+                    timeout=_SOURCE_SYNTHESIS_TIMEOUT_SECONDS,
+                )
+            except (Exception, asyncio.TimeoutError):
+                return ""
+        return ""
 
 
 def _apply_source_order(sources: list[dict], order: list[int]) -> list[dict]:
@@ -734,12 +1466,31 @@ def _apply_source_order(sources: list[dict], order: list[int]) -> list[dict]:
 async def _enrich_and_rank_sources(
     query: str,
     grok_provider: GrokSearchProvider,
+    analysis_provider: GrokSearchProvider | None,
     sources: list[dict],
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, Any]]:
     if not sources:
-        return []
+        return [], {
+            "enrichment_considered": False,
+            "enrichment_applied": False,
+            "ranking_considered": False,
+            "ranking_applied": False,
+            "ranked_source_count": 0,
+        }
 
     prepared = [dict(item) for item in sources]
+    provider_for_analysis = analysis_provider or grok_provider
+    allow_enrichment = _should_enrich_sources(query, prepared)
+    allow_ranking = _should_rank_sources(query, prepared)
+    metadata: dict[str, Any] = {
+        "enrichment_considered": allow_enrichment,
+        "enrichment_applied": False,
+        "ranking_considered": allow_ranking,
+        "ranking_applied": False,
+        "ranked_source_count": 0,
+        "local_priority_considered": _should_prioritize_sources_locally(query, prepared),
+        "local_priority_applied": False,
+    }
 
     enrichable = [
         (index, source["url"])
@@ -747,17 +1498,29 @@ async def _enrich_and_rank_sources(
         if source.get("url") and _source_needs_enrichment(source)
     ][:_MAX_ENRICHABLE_SOURCES]
 
-    if enrichable:
+    if allow_enrichment and enrichable:
         try:
             describe_results = await asyncio.wait_for(
                 asyncio.gather(
-                    *[grok_provider.describe_url(url) for _, url in enrichable],
+                    *[provider_for_analysis.describe_url(url) for _, url in enrichable],
                     return_exceptions=True,
                 ),
                 timeout=_SOURCE_ENRICH_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
-            describe_results = []
+        except (Exception, asyncio.TimeoutError):
+            if provider_for_analysis is not grok_provider:
+                try:
+                    describe_results = await asyncio.wait_for(
+                        asyncio.gather(
+                            *[grok_provider.describe_url(url) for _, url in enrichable],
+                            return_exceptions=True,
+                        ),
+                        timeout=_SOURCE_ENRICH_TIMEOUT_SECONDS,
+                    )
+                except (Exception, asyncio.TimeoutError):
+                    describe_results = []
+            else:
+                describe_results = []
         for (index, _url), result in zip(enrichable, describe_results):
             if isinstance(result, Exception) or not isinstance(result, dict):
                 continue
@@ -767,23 +1530,49 @@ async def _enrich_and_rank_sources(
                 prepared[index]["title"] = title
             if extracts:
                 prepared[index]["description"] = extracts
+                metadata["enrichment_applied"] = True
+
+    prioritized_sources, priority_changed = _prioritize_sources_locally(query, prepared)
+    if priority_changed:
+        prepared = prioritized_sources
+        metadata["local_priority_applied"] = True
 
     if len(prepared) <= 1:
-        return prepared
+        return prepared, metadata
 
-    sources_text = _build_rank_sources_text(prepared)
+    if not allow_ranking:
+        return prepared, metadata
+
+    rank_candidates = prepared[:_MAX_RANKABLE_SOURCES]
+    sources_text = _build_rank_sources_text(rank_candidates)
     if not sources_text.strip():
-        return prepared
+        return prepared, metadata
 
     try:
         order = await asyncio.wait_for(
-            grok_provider.rank_sources(query, sources_text, len(prepared)),
+            provider_for_analysis.rank_sources(query, sources_text, len(rank_candidates)),
             timeout=_SOURCE_RANK_TIMEOUT_SECONDS,
         )
     except (Exception, asyncio.TimeoutError):
-        return prepared
+        if provider_for_analysis is not grok_provider:
+            try:
+                order = await asyncio.wait_for(
+                    grok_provider.rank_sources(query, sources_text, len(rank_candidates)),
+                    timeout=_SOURCE_RANK_TIMEOUT_SECONDS,
+                )
+            except (Exception, asyncio.TimeoutError):
+                return prepared, metadata
+        else:
+            return prepared, metadata
 
-    return _apply_source_order(prepared, order)
+    metadata["ranking_applied"] = True
+    metadata["ranked_source_count"] = len(rank_candidates)
+    prepared = ranked_candidates = _apply_source_order(rank_candidates, order) + prepared[_MAX_RANKABLE_SOURCES:]
+    reprioritized_sources, reprioritized_changed = _prioritize_sources_locally(query, prepared)
+    if reprioritized_changed:
+        prepared = reprioritized_sources
+        metadata["local_priority_applied"] = True
+    return prepared, metadata
 
 
 @mcp.tool(
@@ -823,25 +1612,45 @@ async def web_search(
             return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
         effective_model = model
 
-    grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
     planned_queries = _build_search_queries(query, extra_sources)
     executed_queries: list[dict] = []
     phase_summaries: list[dict[str, Any]] = []
+    prefer_source_synthesis = _is_multifacet_search_query(query)
+    stage_models = await _resolve_stage_models(
+        api_url,
+        api_key,
+        effective_model,
+        query=query,
+        prefer_source_synthesis=prefer_source_synthesis,
+        planned_queries=planned_queries,
+    )
+    grok_provider = GrokSearchProvider(api_url, api_key, stage_models["search"])
+    analysis_provider = (
+        GrokSearchProvider(api_url, api_key, stage_models["analysis"])
+        if stage_models["analysis"] != stage_models["search"]
+        else grok_provider
+    )
 
     # 计算额外信源配额
     has_tavily = config.tavily_enabled and bool(config.tavily_api_key)
     has_firecrawl = bool(config.firecrawl_api_key)
     initial_budget = _select_initial_extra_source_budget(extra_sources, planned_queries)
-    expansion_budget = max(extra_sources - initial_budget, 0)
+    initial_queries = planned_queries[:1]
+    followup_queries = planned_queries[1:]
+    expansion_budget = _select_expansion_extra_source_budget(
+        query,
+        max(extra_sources - initial_budget, 0),
+        followup_queries,
+    )
     initial_tavily_count, initial_firecrawl_count = _split_extra_sources_budget(
         initial_budget, has_tavily, has_firecrawl
     )
 
-    initial_queries = planned_queries[:1]
-    followup_queries = planned_queries[1:]
-
-    # 首轮执行：主搜索 + 小预算聚合
+    # 首轮执行：简单查询保留主搜索并行，复杂查询优先做外部聚合后快速综合
     grok_error: str | None = None
+    grok_fallback_attempted = False
+    grok_fallback_applied = False
+    grok_fallback_reason = ""
 
     async def _safe_grok() -> str:
         nonlocal grok_error
@@ -851,15 +1660,60 @@ async def web_search(
             grok_error = str(exc)
             return ""
 
-    grok_result, initial_batch = await asyncio.gather(
-        _safe_grok(),
-        _run_external_search_batch(
+    async def _run_grok_fallback_search(trigger_reason: str) -> tuple[str, list[dict]]:
+        nonlocal grok_error, grok_fallback_attempted, grok_fallback_applied, grok_fallback_reason
+        grok_fallback_attempted = True
+        grok_fallback_reason = trigger_reason
+        try:
+            fallback_result = await grok_provider.search(query, platform)
+            fallback_answer, fallback_sources = split_answer_and_sources(fallback_result)
+            executed_queries.append(
+                {
+                    "provider": "grok",
+                    "query": query,
+                    "requested": 1,
+                    "results_count": len(fallback_sources),
+                    "status": "ok" if (fallback_answer or fallback_sources) else "empty",
+                    "phase": "fallback",
+                    "reason": trigger_reason,
+                }
+            )
+            if fallback_answer:
+                grok_fallback_applied = True
+            return fallback_answer, fallback_sources
+        except Exception as exc:
+            grok_error = str(exc)
+            executed_queries.append(
+                {
+                    "provider": "grok",
+                    "query": query,
+                    "requested": 1,
+                    "results_count": 0,
+                    "status": "error",
+                    "phase": "fallback",
+                    "reason": trigger_reason,
+                }
+            )
+            return "", []
+
+    if prefer_source_synthesis:
+        grok_result = ""
+        initial_batch = await _run_external_search_batch(
             initial_queries,
             initial_tavily_count,
             initial_firecrawl_count,
             phase="initial",
-        ),
-    )
+        )
+    else:
+        grok_result, initial_batch = await asyncio.gather(
+            _safe_grok(),
+            _run_external_search_batch(
+                initial_queries,
+                initial_tavily_count,
+                initial_firecrawl_count,
+                phase="initial",
+            ),
+        )
     initial_records, initial_tavily_chunks, initial_firecrawl_chunks, initial_used_budget = initial_batch
     executed_queries.extend(initial_records)
 
@@ -871,7 +1725,7 @@ async def web_search(
             "query": query,
             "requested": 1,
             "results_count": len(grok_sources),
-            "status": "error" if grok_error else "ok",
+            "status": "skipped" if prefer_source_synthesis else ("error" if grok_error else "ok"),
             "phase": "initial",
         },
     )
@@ -893,6 +1747,7 @@ async def web_search(
     )
 
     should_expand, initial_support, decision_reason = _should_expand_after_initial(
+        query,
         answer,
         initial_sources,
         followup_queries,
@@ -904,13 +1759,16 @@ async def web_search(
     expansion_records: list[dict] = []
     expansion_tavily_chunks: list[list[dict]] = []
     expansion_firecrawl_chunks: list[list[dict]] = []
-    if should_expand:
+    expansion_queries = followup_queries
+    if _is_multifacet_search_query(query):
+        expansion_queries = followup_queries[:_MAX_FOLLOWUP_QUERIES_FOR_MULTIFACET]
+    if should_expand and expansion_queries:
         expansion_tavily_count, expansion_firecrawl_count = _split_extra_sources_budget(
             expansion_budget, has_tavily, has_firecrawl
         )
         expansion_records, expansion_tavily_chunks, expansion_firecrawl_chunks, expansion_used_budget = (
             await _run_external_search_batch(
-                followup_queries,
+                expansion_queries,
                 expansion_tavily_count,
                 expansion_firecrawl_count,
                 phase="expansion",
@@ -921,7 +1779,7 @@ async def web_search(
         phase_summaries.append(
             {
                 "name": "expansion",
-                "planned_queries": followup_queries,
+                "planned_queries": expansion_queries,
                 "budget_requested": expansion_budget,
                 "budget_used": expansion_used_budget,
                 "task_count": len(expansion_records),
@@ -935,7 +1793,7 @@ async def web_search(
         phase_summaries.append(
             {
                 "name": "expansion",
-                "planned_queries": followup_queries,
+                "planned_queries": expansion_queries,
                 "budget_requested": expansion_budget,
                 "budget_used": 0,
                 "task_count": 0,
@@ -946,10 +1804,45 @@ async def web_search(
         )
         all_sources = initial_sources
 
-    if not answer and grok_error:
-        answer = f"搜索失败: {grok_error}"
-    elif all_sources and not grok_error:
-        all_sources = await _enrich_and_rank_sources(query, grok_provider, all_sources)
+    postprocessing: dict[str, Any] = {}
+    if all_sources:
+        all_sources, postprocessing = await _enrich_and_rank_sources(
+            query,
+            grok_provider,
+            analysis_provider,
+            all_sources,
+        )
+
+    synthesis_reason = ""
+    if prefer_source_synthesis and all_sources:
+        answer = await _synthesize_answer_from_sources(query, analysis_provider, all_sources, grok_provider)
+        if not answer:
+            synthesis_reason = "source_synthesis_failed"
+    if prefer_source_synthesis and not answer:
+        fallback_reason = "source_synthesis_failed" if all_sources else "no_sources_after_external_search"
+        fallback_answer, fallback_sources = await _run_grok_fallback_search(fallback_reason)
+        if fallback_sources:
+            all_sources = merge_sources(all_sources, fallback_sources)
+        if fallback_answer:
+            answer = fallback_answer
+    elif not answer and grok_error:
+        if all_sources:
+            answer = await _synthesize_answer_from_sources(query, analysis_provider, all_sources, grok_provider)
+            if not answer:
+                synthesis_reason = grok_error
+        else:
+            answer = f"搜索失败: {grok_error}"
+
+    if not answer and all_sources:
+        answer = _build_sources_only_fallback_answer(query, all_sources, reason=synthesis_reason or grok_error or "synthesis_unavailable")
+    elif not answer:
+        answer = f"搜索失败: {grok_error or grok_fallback_reason or 'no_results'}"
+
+    inline_citation_sources = _sources_from_inline_citations(answer)
+    if inline_citation_sources:
+        all_sources = merge_sources(all_sources, inline_citation_sources)
+
+    answer, evidence_bindings = _attach_evidence_citations(answer, all_sources)
 
     search_trace = _build_search_trace(
         query,
@@ -964,8 +1857,25 @@ async def web_search(
             "reason": decision_reason,
             "initial_support": initial_support,
         },
+        postprocessing={
+            **postprocessing,
+            "search_model": stage_models["search"],
+            "analysis_model": stage_models["analysis"],
+            "grok_fallback_attempted": grok_fallback_attempted,
+            "grok_fallback_applied": grok_fallback_applied,
+            "grok_fallback_reason": grok_fallback_reason,
+            "source_synthesis_preferred": prefer_source_synthesis,
+            "source_synthesis_applied": bool(
+                prefer_source_synthesis
+                and all_sources
+                and answer
+                and not synthesis_reason
+                and not grok_fallback_applied
+            ),
+            "source_synthesis_reason": synthesis_reason,
+            "inline_citation_sources_count": len(inline_citation_sources),
+        },
     )
-    evidence_bindings = _build_evidence_bindings(answer, all_sources)
     await _SOURCES_CACHE.set(
         session_id,
         {
@@ -1340,7 +2250,7 @@ async def get_config_info() -> str:
     meta={"version": "1.3.0", "author": "guda.studio"},
 )
 async def switch_model(
-    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-2-latest', 'grok-vision-beta')."]
+    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4.20-fast', 'grok-4.20-auto', 'grok-4.20-expert')."]
 ) -> str:
     import json
 
