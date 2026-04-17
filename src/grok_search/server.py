@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
+    from grok_search.fetch_processing import augment_fetched_markdown
     from grok_search.providers.grok import GrokSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
@@ -31,6 +32,7 @@ try:
         _split_csv,
     )
 except ImportError:
+    from .fetch_processing import augment_fetched_markdown
     from .providers.grok import GrokSearchProvider
     from .logger import log_info
     from .config import config
@@ -2057,13 +2059,13 @@ async def web_fetch(
     result = await _call_tavily_extract(url)
     if result:
         await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return result
+        return augment_fetched_markdown(url, result)
 
     await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
     result = await _call_firecrawl_scrape(url, ctx)
     if result:
         await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
-        return result
+        return augment_fetched_markdown(url, result)
 
     await log_info(ctx, "Fetch Failed!", config.debug_enabled)
     if not config.tavily_api_key and not config.firecrawl_api_key:

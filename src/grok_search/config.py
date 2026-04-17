@@ -47,25 +47,44 @@ class Config:
         except IOError as e:
             raise ValueError(f"无法保存配置文件: {str(e)}")
 
+    @staticmethod
+    def _normalize_env_value(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {'"', "'"}:
+            normalized = normalized[1:-1].strip()
+        return normalized
+
+    def _getenv(self, key: str, default: str | None = None) -> str | None:
+        value = self._normalize_env_value(os.getenv(key))
+        if value is None or value == "":
+            return default
+        return value
+
+    def _getenv_bool(self, key: str, default: str = "false") -> bool:
+        value = (self._getenv(key, default) or default).lower()
+        return value in ("true", "1", "yes")
+
     @property
     def debug_enabled(self) -> bool:
-        return os.getenv("GROK_DEBUG", "false").lower() in ("true", "1", "yes")
+        return self._getenv_bool("GROK_DEBUG", "false")
 
     @property
     def retry_max_attempts(self) -> int:
-        return int(os.getenv("GROK_RETRY_MAX_ATTEMPTS", "3"))
+        return int(self._getenv("GROK_RETRY_MAX_ATTEMPTS", "3") or "3")
 
     @property
     def retry_multiplier(self) -> float:
-        return float(os.getenv("GROK_RETRY_MULTIPLIER", "1"))
+        return float(self._getenv("GROK_RETRY_MULTIPLIER", "1") or "1")
 
     @property
     def retry_max_wait(self) -> int:
-        return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
+        return int(self._getenv("GROK_RETRY_MAX_WAIT", "10") or "10")
 
     @property
     def grok_api_url(self) -> str:
-        url = os.getenv("GROK_API_URL")
+        url = self._getenv("GROK_API_URL")
         if not url:
             raise ValueError(
                 f"Grok API URL 未配置！\n"
@@ -75,7 +94,7 @@ class Config:
 
     @property
     def grok_api_key(self) -> str:
-        key = os.getenv("GROK_API_KEY")
+        key = self._getenv("GROK_API_KEY")
         if not key:
             raise ValueError(
                 f"Grok API Key 未配置！\n"
@@ -85,33 +104,33 @@ class Config:
 
     @property
     def tavily_enabled(self) -> bool:
-        return os.getenv("TAVILY_ENABLED", "true").lower() in ("true", "1", "yes")
+        return self._getenv_bool("TAVILY_ENABLED", "true")
 
     @property
     def tavily_api_url(self) -> str:
-        url = os.getenv("TAVILY_API_URL")
+        url = self._getenv("TAVILY_API_URL")
         return url or "https://api.tavily.com"
 
     @property
     def tavily_api_key(self) -> str | None:
-        return os.getenv("TAVILY_API_KEY")
+        return self._getenv("TAVILY_API_KEY")
 
     @property
     def firecrawl_api_url(self) -> str:
-        url = os.getenv("FIRECRAWL_API_URL")
+        url = self._getenv("FIRECRAWL_API_URL")
         return url or "https://api.firecrawl.dev/v2"
 
     @property
     def firecrawl_api_key(self) -> str | None:
-        return os.getenv("FIRECRAWL_API_KEY")
+        return self._getenv("FIRECRAWL_API_KEY")
 
     @property
     def log_level(self) -> str:
-        return os.getenv("GROK_LOG_LEVEL", "INFO").upper()
+        return (self._getenv("GROK_LOG_LEVEL", "INFO") or "INFO").upper()
 
     @property
     def log_dir(self) -> Path:
-        log_dir_str = os.getenv("GROK_LOG_DIR", "logs")
+        log_dir_str = self._getenv("GROK_LOG_DIR", "logs") or "logs"
         log_dir = Path(log_dir_str)
         if log_dir.is_absolute():
             return log_dir
@@ -136,7 +155,7 @@ class Config:
 
     @property
     def sources_cache_dir(self) -> Path:
-        cache_dir = os.getenv("GROK_SOURCES_CACHE_DIR")
+        cache_dir = self._getenv("GROK_SOURCES_CACHE_DIR")
         if cache_dir:
             return Path(cache_dir).expanduser()
         return self.config_file.parent / "sources-cache"
@@ -156,7 +175,7 @@ class Config:
             return self._cached_model
 
         model = (
-            os.getenv("GROK_MODEL")
+            self._getenv("GROK_MODEL")
             or self._load_config_file().get("model")
             or self._DEFAULT_MODEL
         )

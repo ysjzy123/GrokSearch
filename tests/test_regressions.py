@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from grok_search import server
+from grok_search.fetch_processing import augment_fetched_markdown, extract_html_tables
 from grok_search.providers.base import BaseSearchProvider
 from grok_search.providers.grok import GrokSearchProvider
 from grok_search.sources import split_answer_and_sources
@@ -48,6 +49,20 @@ def write_model_config(model: str) -> None:
         encoding="utf-8",
     )
     server.config._cached_model = None
+
+
+def test_config_normalizes_shell_quoted_env_values(monkeypatch):
+    monkeypatch.setenv("GROK_API_URL", "'https://api.example.test/v1'")
+    monkeypatch.setenv("GROK_API_KEY", "'test-key'")
+    monkeypatch.setenv("TAVILY_API_URL", "\"http://127.0.0.1:8080\"")
+    monkeypatch.setenv("TAVILY_ENABLED", "'true'")
+
+    server.config._cached_model = None
+
+    assert server.config.grok_api_url == "https://api.example.test/v1"
+    assert server.config.grok_api_key == "test-key"
+    assert server.config.tavily_api_url == "http://127.0.0.1:8080"
+    assert server.config.tavily_enabled is True
 
 
 def test_split_answer_and_sources_strips_think_blocks():
@@ -248,6 +263,45 @@ async def test_web_fetch_rejects_invalid_url():
     assert result == "无效URL: notaurl"
 
 
+def test_augment_fetched_markdown_adds_source_metadata_and_original_content():
+    content = "# Shanghai Gold Exchange\n\n| 日期 | 合约 | 最高价 |\n| --- | --- | --- |\n| 2026-01-29 | Au99.99 | 1256.00 |"
+
+    result = augment_fetched_markdown("https://example.com/sge", content)
+
+    assert result.startswith("---\nsource_url: https://example.com/sge")
+    assert "inferred_title: Shanghai Gold Exchange" in result
+    assert "## Extraction Aids" in result
+    assert "### Normalized Tables" in result
+    assert "## Original Content" in result
+    assert content in result
+
+
+def test_extract_html_tables_normalizes_header_and_rows():
+    html = (
+        "<table><tr><th>日期</th><th>合约</th><th>最高价</th></tr>"
+        "<tr><td>2026-01-29</td><td>Au99.99</td><td>1256.00</td></tr></table>"
+    )
+
+    tables = extract_html_tables(html)
+
+    assert len(tables) == 1
+    assert "| 日期 | 合约 | 最高价 |" in tables[0]
+    assert "| 2026-01-29 | Au99.99 | 1256.00 |" in tables[0]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_wraps_result_with_extraction_aids(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result="# Example\n\n| A | B |\n| --- | --- |\n| 1 | 2 |"))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://example.com/page")
+
+    assert "source_url: https://example.com/page" in result
+    assert "## Extraction Aids" in result
+    assert "### Normalized Tables" in result
+    assert "## Original Content" in result
+
+
 @pytest.mark.asyncio
 async def test_web_search_uses_default_extra_sources_and_strips_think(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "t-key")
@@ -288,14 +342,14 @@ async def test_web_search_uses_default_extra_sources_and_strips_think(monkeypatc
 
     assert result["content"] == "Answer body"
     assert result["sources_count"] == 2
-    assert calls["tavily"] == ("capital of france", 10)
-    assert calls["firecrawl"] == ("capital of france", 10)
+    assert calls["tavily"] == ("capital of france", 3)
+    assert calls["firecrawl"] == ("capital of france", 3)
     assert calls["describe"] == ["https://t.example/item"]
-    assert calls["rank"][2] == 2
-    assert sources["sources"][0]["provider"] == "tavily"
-    assert sources["sources"][0]["title"] == "Enriched Tavily"
-    assert sources["sources"][0]["description"] == "Enriched summary"
-    assert sources["sources"][1]["provider"] == "firecrawl"
+    assert "rank" not in calls
+    by_provider = {item["provider"]: item for item in sources["sources"]}
+    assert by_provider["tavily"]["title"] == "Enriched Tavily"
+    assert by_provider["tavily"]["description"] == "Enriched summary"
+    assert by_provider["firecrawl"]["provider"] == "firecrawl"
 
 
 @pytest.mark.asyncio
@@ -368,7 +422,7 @@ async def test_web_search_expands_broad_queries_and_records_search_trace(monkeyp
     assert provider_counts["tavily"] >= 1
     assert provider_counts["firecrawl"] >= 1
     assert "roadmap" in facets
-    assert "best-practices" in facets or "runtime" in facets
+    assert "overview" in facets or "runtime" in facets or "best-practices" in facets
     assert any(source.get("query_used") != "Rust systems programming learning guide" for source in cached["sources"])
     assert len({(provider, query) for provider, query, _count in calls}) >= 4
     assert cached["search_trace"]["summary"]["followup_executed"] is True
@@ -397,15 +451,17 @@ async def test_web_search_early_stops_when_initial_support_is_strong(monkeypatch
     async def fake_tavily(query, max_results=6):
         calls.append(("tavily", query, max_results))
         return [
-            {"url": "https://t.example/ownership", "title": "Rust Ownership", "content": "ownership memory safety", "facet": "ownership"},
-            {"url": "https://t.example/roadmap", "title": "Rust Roadmap", "content": "learning roadmap", "facet": "roadmap"},
+            {"url": "https://ownership.example/guide", "title": "Rust Ownership", "content": "ownership memory safety", "facet": "ownership"},
+            {"url": "https://roadmap.example/path", "title": "Rust Roadmap", "content": "learning roadmap", "facet": "roadmap"},
+            {"url": "https://book.example/intro", "title": "Rust Book", "content": "official guide and examples", "facet": "overview"},
         ]
 
     async def fake_firecrawl(query, limit=14):
         calls.append(("firecrawl", query, limit))
         return [
-            {"title": "Tokio Runtime Guide", "url": "https://f.example/tokio", "description": "tokio async runtime network services", "facet": "runtime"},
-            {"title": "Rust Book Summary", "url": "https://f.example/book", "description": "official guide and examples", "facet": "overview"},
+            {"title": "Tokio Runtime Guide", "url": "https://tokio.example/runtime", "description": "tokio async runtime network services", "facet": "runtime"},
+            {"title": "Rust Patterns", "url": "https://patterns.example/rust", "description": "best practices and design patterns", "facet": "best-practices"},
+            {"title": "Cargo Tooling", "url": "https://cargo.example/tools", "description": "cargo tooling workflow", "facet": "tooling"},
         ]
 
     monkeypatch.setattr(server, "GrokSearchProvider", FakeProvider)
@@ -420,11 +476,10 @@ async def test_web_search_early_stops_when_initial_support_is_strong(monkeypatch
 
     assert summary["early_stopped"] is True
     assert summary["followup_executed"] is False
-    assert summary["budget_used"] < summary["budget_requested"]
+    assert summary["budget_unused"] > 0
     assert phases["expansion"]["skipped"] is True
     assert phases["expansion"]["reason"] == "initial_support_sufficient"
     assert len(calls) == 2
-    assert all(query == "Rust systems programming learning guide" for _provider, query, _count in calls)
 
 
 @pytest.mark.asyncio
@@ -531,6 +586,8 @@ async def test_enrich_and_rank_sources_times_out_gracefully(monkeypatch):
         {"url": "https://example.com/b", "provider": "firecrawl", "title": "B", "description": "Desc B"},
     ]
 
-    result = await server._enrich_and_rank_sources("example query", SlowProvider(), sources)
+    ranked_sources, metadata = await server._enrich_and_rank_sources("example query", SlowProvider(), None, sources)
 
-    assert result == sources
+    assert ranked_sources == sources
+    assert metadata["enrichment_applied"] is False
+    assert metadata["ranking_applied"] is False

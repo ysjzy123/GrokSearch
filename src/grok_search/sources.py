@@ -1,12 +1,11 @@
 import ast
+import asyncio
 import json
 import re
 import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
-
-import asyncio
 
 from .utils import extract_unique_urls
 
@@ -58,7 +57,11 @@ class SourcesCache:
     def _prune_disk(self) -> None:
         if self._persist_dir is None:
             return
-        files = sorted(self._persist_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        def _sort_key(path: Path) -> tuple[int, int, str]:
+            stat = path.stat()
+            return (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)), getattr(stat, "st_ctime_ns", 0), path.name)
+
+        files = sorted(self._persist_dir.glob("*.json"), key=_sort_key)
         while len(files) > self._max_size:
             oldest = files.pop(0)
             try:

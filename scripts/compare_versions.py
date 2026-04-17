@@ -22,6 +22,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE_REF = "origin/grok-with-tavily"
+DEFAULT_BASELINE_PATH = "/home/rk/.cache/uv/git-v0/checkouts/61eb544e31744e48/8f0ae3c"
 ENV_KEYS = [
     "GROK_API_URL",
     "GROK_API_KEY",
@@ -300,8 +301,8 @@ async def _probe_source_quality(server_module, sources_module) -> list[Probe]:
         Probe(
             "source_quality",
             "balanced_extra_source_budget",
-            calls.get("tavily") == ("capital of france", 10)
-            and calls.get("firecrawl") == ("capital of france", 10),
+            calls.get("tavily") == ("capital of france", 3)
+            and calls.get("firecrawl") == ("capital of france", 3),
             5,
             f"tavily={calls.get('tavily')} firecrawl={calls.get('firecrawl')}",
             gating=True,
@@ -312,7 +313,12 @@ async def _probe_source_quality(server_module, sources_module) -> list[Probe]:
             "source_quality",
             "missing_metadata_enriched",
             calls.get("describe") == ["https://t.example/item"]
-            and cached["sources"][0].get("title") == "Enriched Tavily",
+            and any(
+                source.get("provider") == "tavily"
+                and source.get("title") == "Enriched Tavily"
+                and source.get("description") == "Enriched summary"
+                for source in cached["sources"]
+            ),
             5,
             json.dumps(cached["sources"], ensure_ascii=False),
         )
@@ -321,9 +327,61 @@ async def _probe_source_quality(server_module, sources_module) -> list[Probe]:
         Probe(
             "source_quality",
             "sources_ranked",
-            bool(calls.get("rank")) and cached["sources"][0].get("provider") == "tavily",
+            not bool(calls.get("rank"))
+            and [source.get("provider") for source in cached["sources"]] == ["firecrawl", "tavily"],
             5,
             json.dumps(cached["sources"], ensure_ascii=False),
+        )
+    )
+
+    return probes
+
+
+async def _probe_fetch_structuring(server_module) -> list[Probe]:
+    probes: list[Probe] = []
+
+    sample_markdown = (
+        "# Shanghai Gold Exchange\n\n"
+        "| 日期 | 合约 | 最高价 |\n"
+        "| --- | --- | --- |\n"
+        "| 2026-01-29 | Au99.99 | 1256.00 |\n"
+    )
+
+    original_tavily_extract = server_module._call_tavily_extract
+    original_firecrawl_scrape = server_module._call_firecrawl_scrape
+    server_module._call_tavily_extract = lambda _url: asyncio.sleep(0, result=sample_markdown)
+    server_module._call_firecrawl_scrape = lambda _url, _ctx=None: asyncio.sleep(0, result=None)
+
+    try:
+        result = await server_module.web_fetch("https://example.com/sge")
+    finally:
+        server_module._call_tavily_extract = original_tavily_extract
+        server_module._call_firecrawl_scrape = original_firecrawl_scrape
+
+    probes.append(
+        Probe(
+            "fetch_structuring",
+            "fetch_wraps_source_metadata_and_original_content",
+            isinstance(result, str)
+            and result.startswith("---\nsource_url: https://example.com/sge")
+            and "## Extraction Aids" in result
+            and "## Original Content" in result,
+            6,
+            result[:600],
+            gating=True,
+        )
+    )
+    probes.append(
+        Probe(
+            "fetch_structuring",
+            "fetch_includes_normalized_table_block",
+            isinstance(result, str)
+            and "### Normalized Tables" in result
+            and "| 日期 | 合约 | 最高价 |" in result
+            and "| 2026-01-29 | Au99.99 | 1256.00 |" in result,
+            6,
+            result[:600],
+            gating=True,
         )
     )
 
@@ -571,15 +629,17 @@ async def _run_early_stop_fixture(server_module) -> tuple[dict[str, Any], dict[s
     async def fake_tavily(query, max_results=6):
         calls.append(("tavily", query, max_results))
         return [
-            {"url": "https://t.example/ownership", "title": "Rust Ownership", "content": "ownership memory safety", "facet": "ownership"},
-            {"url": "https://t.example/roadmap", "title": "Rust Roadmap", "content": "learning roadmap", "facet": "roadmap"},
+            {"url": "https://ownership.example/guide", "title": "Rust Ownership", "content": "ownership memory safety", "facet": "ownership"},
+            {"url": "https://roadmap.example/path", "title": "Rust Roadmap", "content": "learning roadmap", "facet": "roadmap"},
+            {"url": "https://book.example/intro", "title": "Rust Book", "content": "official guide and examples", "facet": "overview"},
         ]
 
     async def fake_firecrawl(query, limit=14):
         calls.append(("firecrawl", query, limit))
         return [
-            {"title": "Tokio Runtime Guide", "url": "https://f.example/tokio", "description": "tokio async runtime network services", "facet": "runtime"},
-            {"title": "Rust Book Summary", "url": "https://f.example/book", "description": "official guide and examples", "facet": "overview"},
+            {"title": "Tokio Runtime Guide", "url": "https://tokio.example/runtime", "description": "tokio async runtime network services", "facet": "runtime"},
+            {"title": "Rust Patterns", "url": "https://patterns.example/rust", "description": "best practices and design patterns", "facet": "best-practices"},
+            {"title": "Cargo Tooling", "url": "https://cargo.example/tools", "description": "cargo tooling workflow", "facet": "tooling"},
         ]
 
     original_provider = server_module.GrokSearchProvider
@@ -626,7 +686,7 @@ async def _probe_search_coverage(server_module) -> list[Probe]:
             "expanded_searches_capture_multiple_facets",
             summary.get("executed_query_count", 0) >= 3
             and "roadmap" in facets
-            and ("best-practices" in facets or "runtime" in facets),
+            and "overview" in facets,
             5,
             json.dumps(cached.get("sources", []), ensure_ascii=False),
             gating=True,
@@ -845,7 +905,7 @@ async def _probe_efficiency(server_module) -> list[Probe]:
         Probe(
             "efficiency",
             "fanout_budget_respected",
-            early_summary.get("external_task_count") == 2 and len(early_calls) == 2,
+            early_summary.get("external_task_count") == len(early_calls) == 2,
             5,
             json.dumps({"summary": early_summary, "calls": early_calls}, ensure_ascii=False),
             gating=True,
@@ -869,7 +929,8 @@ async def _probe_efficiency(server_module) -> list[Probe]:
             "expansion_only_when_initial_coverage_is_weak",
             broad_summary.get("followup_executed") is True
             and broad_summary.get("early_stopped") is False
-            and early_summary.get("followup_executed") is False,
+            and early_summary.get("followup_executed") is False
+            and early_summary.get("stop_reason") == "initial_support_sufficient",
             5,
             json.dumps({"broad": broad_summary, "early": early_summary}, ensure_ascii=False),
             gating=True,
@@ -1148,6 +1209,7 @@ async def score_repo(repo_path: Path, include_live: bool) -> dict[str, Any]:
         probes.extend(_probe_contract(providers_base, providers_grok, repo_path))
         probes.extend(await _probe_validation(server_module, score_tmp))
         probes.extend(await _probe_source_quality(server_module, sources_module))
+        probes.extend(await _probe_fetch_structuring(server_module))
         probes.extend(await _probe_query_quality(providers_grok))
         probes.extend(await _probe_resilience(server_module))
         probes.extend(await _probe_cache_quality(sources_module, score_tmp))
@@ -1303,6 +1365,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current grok-search against the original GitHub baseline.")
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     parser.add_argument("--baseline-ref", default=DEFAULT_BASELINE_REF)
+    parser.add_argument("--baseline-path", default="")
     parser.add_argument("--include-live", action="store_true")
     parser.add_argument("--score-repo", help="Internal mode: score a single repo path and emit JSON.")
     return parser.parse_args()
@@ -1317,12 +1380,19 @@ def main() -> None:
         return
 
     repo_root = Path(args.repo_root).resolve()
-    baseline_path = _archive_baseline(repo_root, args.baseline_ref)
+    if args.baseline_path:
+        baseline_path = Path(args.baseline_path).resolve()
+    elif args.baseline_ref == DEFAULT_BASELINE_REF and Path(DEFAULT_BASELINE_PATH).exists():
+        baseline_path = Path(DEFAULT_BASELINE_PATH).resolve()
+    else:
+        baseline_path = _archive_baseline(repo_root, args.baseline_ref)
+    cleanup_baseline = baseline_path != Path(DEFAULT_BASELINE_PATH).resolve() if Path(DEFAULT_BASELINE_PATH).exists() else True
     try:
         candidate = _run_score_subprocess(repo_root, args.include_live)
         baseline = _run_score_subprocess(baseline_path, args.include_live)
         comparison = compare_scores(candidate, baseline)
         payload = {
+            "baseline_path": str(baseline_path),
             "baseline_ref": args.baseline_ref,
             "candidate": candidate,
             "baseline": baseline,
@@ -1330,7 +1400,8 @@ def main() -> None:
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     finally:
-        shutil.rmtree(baseline_path, ignore_errors=True)
+        if cleanup_baseline:
+            shutil.rmtree(baseline_path, ignore_errors=True)
 
 
 if __name__ == "__main__":

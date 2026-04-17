@@ -166,7 +166,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_with_fallback(headers, payload, ctx)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {

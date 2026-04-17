@@ -75,17 +75,18 @@ def test_compare_scores_allows_historical_gating_failures_without_new_regression
 def test_compare_versions_subprocess_isolates_baseline_scores():
     compare_versions = load_compare_versions()
 
-    baseline_dir = compare_versions._archive_baseline(ROOT, "origin/grok-with-tavily")
+    baseline_dir = Path(compare_versions.DEFAULT_BASELINE_PATH)
     try:
         candidate = compare_versions._run_score_subprocess(ROOT, include_live=False)
         baseline = compare_versions._run_score_subprocess(baseline_dir, include_live=False)
         result = compare_versions.compare_scores(candidate, baseline)
     finally:
-        shutil.rmtree(baseline_dir, ignore_errors=True)
+        pass
 
     assert candidate["total_score"] > baseline["total_score"]
     assert candidate["categories"]["contract"]["score"] > baseline["categories"]["contract"]["score"]
     assert candidate["categories"]["cache_quality"]["score"] > baseline["categories"]["cache_quality"]["score"]
+    assert candidate["categories"]["fetch_structuring"]["score"] > baseline["categories"].get("fetch_structuring", {}).get("score", 0)
     assert candidate["categories"]["search_coverage"]["score"] > baseline["categories"]["search_coverage"]["score"]
     assert candidate["categories"]["aggregation_breadth"]["score"] > baseline["categories"]["aggregation_breadth"]["score"]
     assert candidate["categories"]["evidence_binding"]["score"] > baseline["categories"]["evidence_binding"]["score"]
