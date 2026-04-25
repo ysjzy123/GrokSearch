@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
+import json
 import re
+import html
 from collections import Counter
 
 # 支持直接运行：添加 src 目录到 Python 路径
@@ -15,7 +17,7 @@ from urllib.parse import urlparse
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
-    from grok_search.fetch_processing import augment_fetched_markdown
+    from grok_search.fetch_processing import augment_fetched_markdown, extract_reddit_json_post_fields
     from grok_search.providers.grok import GrokSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
@@ -32,7 +34,7 @@ try:
         _split_csv,
     )
 except ImportError:
-    from .fetch_processing import augment_fetched_markdown
+    from .fetch_processing import augment_fetched_markdown, extract_reddit_json_post_fields
     from .providers.grok import GrokSearchProvider
     from .logger import log_info
     from .config import config
@@ -81,6 +83,182 @@ _SOURCE_ENRICH_TIMEOUT_SECONDS = 8.0
 _SOURCE_RANK_TIMEOUT_SECONDS = 4.0
 _SOURCE_SYNTHESIS_TIMEOUT_SECONDS = 18.0
 _MAX_SYNTHESIS_SOURCES = 8
+_LOW_QUALITY_FETCH_MARKERS = (
+    "navigation menu",
+    "saved searches",
+    "provide feedback",
+    "github menu",
+    "sign in",
+    "log in",
+    "请您登录后查看更多专业优质内容",
+    "回到首页",
+    "404 - 您访问的页面不存在",
+    "可能是网址有误",
+    "对应的内容已被删除",
+    "处于私有状态",
+    "please wait for verification",
+    "js_challenge",
+    "need_login=true",
+    "account/unhuman",
+    "找不到页面",
+)
+_LOW_QUALITY_UI_PREFIXES = (
+    "navigation menu",
+    "skip to content",
+    "saved searches",
+    "provide feedback",
+    "sign in",
+    "log in",
+    "sign up",
+    "create account",
+    "open menu",
+    "back to top",
+    "open app",
+    "打开app",
+    "打开 app",
+    "打开知乎 app",
+    "打开知乎app",
+    "get app",
+    "use app",
+    "download app",
+    "登录后查看更多",
+    "登录/注册后",
+    "回到首页",
+    "404 - 您访问的页面不存在",
+    "可能是网址有误",
+    "对应的内容已被删除",
+    "处于私有状态",
+    "please wait for verification",
+    "找不到页面",
+)
+_SEARCH_RECOVERY_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_SEARCH_RECOVERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "did",
+    "do",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+}
+_DOMAIN_LOW_QUALITY_FETCH_MARKERS = {
+    "github.com": (
+        "skip to content",
+        "search or jump to",
+        "saved searches",
+        "use saved searches to filter your results more quickly",
+        "github menu",
+        "there was an error while loading",
+    ),
+    "reddit.com": (
+        "reddit - dive into anything",
+        "open menu",
+        "create account",
+        "get app",
+        "use app",
+        "view in the reddit app",
+        "back to top",
+        "please wait for verification",
+        "js_challenge",
+        "solution",
+    ),
+    "zhihu.com": (
+        "知乎，让每一次点击都充满意义",
+        "打开知乎 app",
+        "打开知乎app",
+        "在 app 内查看完整内容",
+        "登录/注册后即可查看更多内容",
+        "查看全部回答",
+        "写回答",
+        "need_login=true",
+        "account/unhuman",
+        "欢迎来到知乎，发现问题背后的世界",
+        "zse-ck",
+    ),
+    "juejin.cn": (
+        "稀土掘金",
+        "登录后查看更多优质内容",
+        "打开app",
+        "打开 app",
+        "继续访问",
+        "点赞",
+        "评论",
+        "收藏",
+        "找不到页面",
+        "\"statusCode\":404",
+        "\"errorView\":\"NotFoundView\"",
+        "verifyCenter",
+    ),
+    "cnblogs.com": (
+        "公告",
+        "昵称：",
+        "园龄：",
+        "粉丝：",
+        "关注：",
+        "积分与排名",
+        "随笔档案",
+        "阅读排行榜",
+        "404 - 您访问的页面不存在",
+        "可能是网址有误",
+        "对应的内容已被删除",
+        "处于私有状态",
+        "邮件联系：contact@cnblogs.com",
+    ),
+}
+_SITE_FETCH_FALLBACK_DOMAINS = {
+    "github.com",
+    "reddit.com",
+    "zhihu.com",
+    "juejin.cn",
+}
+_FETCH_FALLBACK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
 _AUTHORITATIVE_SOURCE_DOMAINS = {
     "fastapi.tiangolo.com",
     "react.dev",
@@ -211,7 +389,7 @@ async def _fetch_available_models(api_url: str, api_key: str) -> list[str]:
     import httpx
 
     models_url = f"{api_url.rstrip('/')}/models"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
         response = await client.get(
             models_url,
             headers={
@@ -1926,6 +2104,750 @@ async def get_sources(
     return response
 
 
+def _normalized_fetch_domain(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    domain = parsed.netloc.lower().split(":", 1)[0]
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def _should_try_site_fetch_fallback(url: str | None) -> bool:
+    domain = _normalized_fetch_domain(url)
+    return any(domain == item or domain.endswith(f".{item}") for item in _SITE_FETCH_FALLBACK_DOMAINS)
+
+
+def _domain_specific_fetch_markers(url: str | None) -> tuple[str, ...]:
+    domain = _normalized_fetch_domain(url)
+    for candidate, markers in _DOMAIN_LOW_QUALITY_FETCH_MARKERS.items():
+        if domain == candidate or domain.endswith(f".{candidate}"):
+            return markers
+    return ()
+
+
+def _extract_html_title(html_text: str) -> str:
+    match = _HTML_TITLE_PATTERN.search(html_text or "")
+    if not match:
+        return ""
+    title = html.unescape(re.sub(r"\s+", " ", match.group(1))).strip()
+    return title
+
+
+def _extract_meta_content(html_text: str, name: str) -> str:
+    patterns = (
+        rf'(?is)<meta[^>]+name=["\']{re.escape(name)}["\'][^>]+content=["\'](.*?)["\']',
+        rf'(?is)<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']{re.escape(name)}["\']',
+        rf'(?is)<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\'](.*?)["\']',
+        rf'(?is)<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(name)}["\']',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html_text or "")
+        if match:
+            return html.unescape(re.sub(r"\s+", " ", match.group(1))).strip()
+    return ""
+
+
+def _build_meta_summary_markdown(
+    url: str,
+    title: str,
+    description: str,
+    source_note: str,
+    *,
+    fallback_mode: str = "metadata_summary",
+) -> str | None:
+    title = (title or "").strip()
+    description = (description or "").strip()
+    if not title and not description:
+        return None
+
+    parts = []
+    if title:
+        parts.append(f"# {title}")
+    if source_note:
+        parts.append(f"> {source_note}")
+    parts.append("")
+    if description:
+        parts.append("## Summary")
+        parts.append("")
+        parts.append(description)
+        parts.append("")
+    parts.append("## Fetch Notes")
+    parts.append("")
+    parts.append(f"- source_url: {url}")
+    parts.append(f"- fallback_mode: {fallback_mode}")
+    return "\n".join(parts).strip()
+
+
+def _normalize_search_recovery_result(provider: str, item: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    url = (item.get("url") or item.get("id") or "").strip()
+    title = (item.get("title") or "").strip()
+    content = (
+        item.get("content")
+        or item.get("text")
+        or item.get("description")
+        or item.get("snippet")
+        or ""
+    )
+    if isinstance(content, list):
+        content = " ".join(str(part).strip() for part in content if str(part).strip())
+    content = str(content).strip()
+    if not url and not title and not content:
+        return None
+    return {
+        "provider": provider,
+        "url": url,
+        "title": title,
+        "content": content,
+        "score": item.get("score", 0),
+    }
+
+
+def _extract_search_recovery_id_tokens(url: str) -> tuple[str, ...]:
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        return ()
+    tokens = [segment.strip() for segment in path.split("/") if segment.strip().isdigit()]
+    return tuple(dict.fromkeys(tokens))
+
+
+def _search_recovery_word_tokens(text: str | None) -> tuple[str, ...]:
+    if not text:
+        return ()
+    tokens = [
+        token
+        for token in _SEARCH_RECOVERY_WORD_PATTERN.findall(str(text).lower())
+        if len(token) >= 2 and token not in _SEARCH_RECOVERY_STOPWORDS
+    ]
+    return tuple(dict.fromkeys(tokens))
+
+
+def _extract_reddit_recovery_signals(url: str) -> dict[str, Any]:
+    signals: dict[str, Any] = {
+        "domain": _normalized_fetch_domain(url),
+        "path": "",
+        "subreddit": "",
+        "post_id": "",
+        "slug": "",
+        "slug_phrase": "",
+        "slug_tokens": (),
+    }
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        return signals
+
+    normalized_path = path.rstrip("/")
+    signals["path"] = normalized_path
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if len(segments) >= 4 and segments[0].lower() == "r" and segments[2].lower() == "comments":
+        signals["subreddit"] = segments[1]
+        signals["post_id"] = segments[3].lower()
+        if len(segments) >= 5:
+            signals["slug"] = segments[4]
+    elif len(segments) >= 2 and segments[0].lower() == "comments":
+        signals["post_id"] = segments[1].lower()
+        if len(segments) >= 3:
+            signals["slug"] = segments[2]
+
+    slug_phrase = re.sub(r"[-_]+", " ", str(signals["slug"] or "")).strip()
+    signals["slug_phrase"] = slug_phrase
+    signals["slug_tokens"] = _search_recovery_word_tokens(slug_phrase)
+    return signals
+
+
+def _extract_zhihu_recovery_signals(url: str) -> dict[str, Any]:
+    signals: dict[str, Any] = {
+        "domain": _normalized_fetch_domain(url),
+        "path": "",
+        "kind": "",
+        "object_id": "",
+        "answer_id": "",
+    }
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        return signals
+
+    normalized_path = path.rstrip("/")
+    signals["path"] = normalized_path
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    domain = str(signals.get("domain") or "")
+    if domain == "zhuanlan.zhihu.com" and len(segments) >= 2 and segments[0] == "p":
+        signals["kind"] = "article"
+        signals["object_id"] = segments[1]
+    elif len(segments) >= 2 and segments[0] == "question":
+        signals["kind"] = "question"
+        signals["object_id"] = segments[1]
+        if len(segments) >= 4 and segments[2] == "answer":
+            signals["answer_id"] = segments[3]
+    return signals
+
+
+def _reddit_search_recovery_slug_overlap(target_url: str, item: dict[str, Any]) -> int:
+    target_tokens = set(_extract_reddit_recovery_signals(target_url).get("slug_tokens") or ())
+    if not target_tokens:
+        return 0
+
+    item_url = str(item.get("url") or "").strip()
+    item_signals = _extract_reddit_recovery_signals(item_url) if item_url else {}
+    haystack = " ".join(
+        part
+        for part in (
+            str(item.get("title") or ""),
+            str(item.get("content") or ""),
+            str(item_signals.get("slug_phrase") or ""),
+            item_url,
+        )
+        if part
+    )
+    item_tokens = set(_search_recovery_word_tokens(haystack))
+    return len(target_tokens & item_tokens)
+
+
+def _is_reliable_reddit_search_recovery_result(item: dict[str, Any], target_url: str) -> bool:
+    item_url = str(item.get("url") or "").strip()
+    if not item_url:
+        return False
+
+    item_domain = _normalized_fetch_domain(item_url)
+    if not (item_domain == "reddit.com" or item_domain.endswith(".reddit.com")):
+        return False
+
+    target_signals = _extract_reddit_recovery_signals(target_url)
+    item_signals = _extract_reddit_recovery_signals(item_url)
+    target_path = str(target_signals.get("path") or "")
+    item_path = str(item_signals.get("path") or "")
+
+    if item_url == target_url or (target_path and item_path == target_path):
+        return True
+
+    combined_text = " ".join(
+        part
+        for part in (
+            str(item.get("title") or ""),
+            str(item.get("content") or ""),
+            item_url,
+        )
+        if part
+    ).lower()
+    if any(
+        marker in combined_text
+        for marker in (
+            "create account",
+            "view in the reddit app",
+            "open menu",
+            "please wait for verification",
+            "related answers",
+        )
+    ):
+        return False
+
+    target_post_id = str(target_signals.get("post_id") or "")
+    item_post_id = str(item_signals.get("post_id") or "")
+    if target_post_id:
+        return bool(item_post_id and item_post_id == target_post_id)
+
+    target_subreddit = str(target_signals.get("subreddit") or "").lower()
+    item_subreddit = str(item_signals.get("subreddit") or "").lower()
+    if target_subreddit and item_subreddit and target_subreddit != item_subreddit:
+        return False
+
+    return _reddit_search_recovery_slug_overlap(target_url, item) >= 2
+
+
+def _is_reliable_zhihu_search_recovery_result(item: dict[str, Any], target_url: str) -> bool:
+    item_url = str(item.get("url") or "").strip()
+    if not item_url:
+        return False
+
+    item_domain = _normalized_fetch_domain(item_url)
+    if not item_domain.endswith("zhihu.com"):
+        return False
+
+    try:
+        item_path = urlparse(item_url).path or ""
+    except ValueError:
+        item_path = ""
+    try:
+        target_path = urlparse(target_url).path or ""
+    except ValueError:
+        target_path = ""
+
+    title = str(item.get("title") or "").strip().lower()
+    content = str(item.get("content") or "").strip().lower()
+    generic_titles = {
+        "知乎客户端",
+        "404 - 知乎",
+        "知乎大学",
+        "发现- 知乎",
+        "发现 - 知乎",
+        "知乎，让每一次点击都充满意义",
+        "知乎- 有问题，就会有答案",
+        "知乎 - 有问题，就会有答案",
+        "知乎专栏- 随心写作，自由表达- 知乎",
+    }
+    if title in {value.lower() for value in generic_titles}:
+        return False
+
+    blocked_markers = (
+        "请您登录后查看更多专业优质内容",
+        "立即登录/注册",
+        "登录一下",
+        "更多精彩内容等你发现",
+        "欢迎来到知乎，发现问题背后的世界",
+        "知乎，让每一次点击都充满意义",
+        "请求参数异常，请升级客户端后重试",
+        "need_login=true",
+        "account/unhuman",
+    )
+    combined_text = " ".join([item_url, title, content]).lower()
+    if any(marker in combined_text for marker in blocked_markers):
+        return False
+
+    if item_url == target_url or (target_path and item_path == target_path):
+        return True
+
+    return any(token and token in combined_text for token in _extract_search_recovery_id_tokens(target_url))
+
+
+def _build_zhihu_search_recovery_queries(url: str) -> tuple[str, ...]:
+    signals = _extract_zhihu_recovery_signals(url)
+    domain = str(signals.get("domain") or "").strip()
+    kind = str(signals.get("kind") or "").strip()
+    object_id = str(signals.get("object_id") or "").strip()
+    answer_id = str(signals.get("answer_id") or "").strip()
+
+    queries = [f"site:{domain} {url}"]
+    if kind == "question" and object_id:
+        queries.append(f"site:zhihu.com/question/{object_id}")
+        queries.append(f"site:zhihu.com/question {object_id}")
+        if answer_id:
+            queries.append(f"site:zhihu.com/question/{object_id}/answer/{answer_id}")
+            queries.append(f"site:zhihu.com/answer {answer_id}")
+    elif kind == "article" and object_id:
+        queries.append(f"site:zhuanlan.zhihu.com/p/{object_id}")
+        queries.append(f"site:zhuanlan.zhihu.com {object_id}")
+
+    return tuple(dict.fromkeys(query.strip() for query in queries if query and query.strip()))
+
+
+def _build_zhihu_identity_summary_markdown(url: str, source_note: str) -> str | None:
+    domain = _normalized_fetch_domain(url)
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        path = ""
+
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if domain == "zhuanlan.zhihu.com" and len(segments) >= 2 and segments[0] == "p":
+        object_id = segments[1]
+        title = f"知乎专栏文章 {object_id}"
+        description = (
+            f"该链接指向知乎专栏文章页，文章 ID 为 {object_id}。当前抓取环境命中了知乎风控或访问拦截，"
+            "未恢复到可验证的公开标题或摘要，因此这里只保留可以从 URL 结构稳定确认的页面标识。\n\n"
+            "如果后续提供可用登录态、浏览器态或额外外部索引，可以基于同一链接再次抓取，以恢复标题、摘要或正文。"
+        )
+    elif len(segments) >= 2 and segments[0] == "question":
+        object_id = segments[1]
+        title = f"知乎问题 {object_id}"
+        description = (
+            f"该链接指向知乎问题页，问题 ID 为 {object_id}。当前抓取环境命中了知乎风控或访问拦截，"
+            "未恢复到可验证的公开标题或摘要，因此这里只保留可以从 URL 结构稳定确认的页面标识。\n\n"
+            "如果后续提供可用登录态、浏览器态或额外外部索引，可以基于同一链接再次抓取，以恢复题目标题、摘要或正文。"
+        )
+    else:
+        title = f"{domain} 页面"
+        description = (
+            "当前链接无法直接抓取正文，且没有恢复到可验证的公开标题或摘要。"
+            "以下结果仅保留 URL 与站点类型等可确认信息，避免把不可靠搜索命中误判为正文。"
+        )
+
+    return _build_meta_summary_markdown(
+        url,
+        title,
+        description,
+        source_note,
+        fallback_mode="url_identity_summary",
+    )
+
+
+def _build_reddit_identity_summary_markdown(url: str, source_note: str) -> str | None:
+    signals = _extract_reddit_recovery_signals(url)
+    subreddit = str(signals.get("subreddit") or "").strip()
+    post_id = str(signals.get("post_id") or "").strip()
+    slug_phrase = str(signals.get("slug_phrase") or "").strip()
+    if not post_id:
+        return None
+
+    base_title = f"Reddit r/{subreddit} thread {post_id}" if subreddit else f"Reddit thread {post_id}"
+    title = base_title
+    topic_note = ""
+    if slug_phrase:
+        title = f'{base_title} (URL-derived topic: {slug_phrase})'
+        topic_note = (
+            f'URL slug suggests the topic may be "{slug_phrase}". '
+            "This phrase comes from the URL structure only and is not treated as a verified public title."
+        )
+
+    description_parts = [
+        (
+            f"This link points to a Reddit discussion thread with post id `{post_id}`"
+            + (f" under `r/{subreddit}`." if subreddit else ".")
+        ),
+        "The fetch path hit Reddit anti-bot protection, and search recovery did not return a reliably matched summary for the same thread.",
+    ]
+    if topic_note:
+        description_parts.append(topic_note)
+    description_parts.append(
+        "The fallback keeps only stable identity signals from the URL so the result stays conservative instead of summarizing a different Reddit post."
+    )
+    description = "\n\n".join(description_parts)
+    return _build_meta_summary_markdown(
+        url,
+        title,
+        description,
+        source_note,
+        fallback_mode="url_identity_summary",
+    )
+
+
+def _build_reddit_search_recovery_queries(url: str) -> tuple[str, ...]:
+    signals = _extract_reddit_recovery_signals(url)
+    subreddit = str(signals.get("subreddit") or "").strip()
+    post_id = str(signals.get("post_id") or "").strip()
+    slug_phrase = str(signals.get("slug_phrase") or "").strip()
+    slug_tokens = tuple(signals.get("slug_tokens") or ())
+
+    queries = [f"site:reddit.com {url}"]
+    if subreddit and post_id:
+        queries.append(f"site:reddit.com/r/{subreddit} comments {post_id}")
+    if subreddit and slug_phrase:
+        queries.append(f'site:reddit.com/r/{subreddit} "{slug_phrase}"')
+    keyword_tail = " ".join(slug_tokens[:4])
+    if subreddit and (post_id or keyword_tail):
+        queries.append(" ".join(part for part in ("reddit", subreddit, post_id, keyword_tail) if part).strip())
+
+    return tuple(dict.fromkeys(query.strip() for query in queries if query and query.strip()))
+
+
+def _build_reddit_json_fallback_url(url: str) -> str | None:
+    signals = _extract_reddit_recovery_signals(url)
+    post_id = str(signals.get("post_id") or "").strip()
+    if not post_id:
+        return None
+    return f"https://www.reddit.com/comments/{post_id}/.json?raw_json=1"
+
+
+def _build_reddit_json_fallback_markdown(
+    url: str,
+    text: str | None,
+    source_note: str,
+    *,
+    recovery_provider: str = "",
+) -> str | None:
+    post = extract_reddit_json_post_fields(text or "")
+    if not isinstance(post, dict):
+        return None
+
+    title = str(post.get("title") or "").strip()
+    subreddit = str(post.get("subreddit_name_prefixed") or post.get("subreddit") or "").strip()
+    author = str(post.get("author") or "").strip()
+    body = str(post.get("selftext") or "").strip()
+    permalink = str(post.get("permalink") or "").strip()
+    score = post.get("score")
+    num_comments = post.get("num_comments")
+    over_18 = post.get("over_18")
+    removed_by_category = str(post.get("removed_by_category") or "").strip().lower()
+
+    title_lower = title.lower()
+    if not title or title_lower in {"reddit - the heart of the internet", "reddit - dive into anything"}:
+        return None
+    if removed_by_category in {"deleted", "removed"}:
+        return None
+    if str(author).strip().lower() == "[deleted]" and body in {"", "[removed]", "[deleted]"}:
+        return None
+    if over_18 is True:
+        return None
+
+    target_signals = _extract_reddit_recovery_signals(url)
+    target_post_id = str(target_signals.get("post_id") or "").strip().lower()
+    target_subreddit = str(target_signals.get("subreddit") or "").strip().lower()
+    post_id = str(post.get("id") or "").strip().lower()
+    post_subreddit = subreddit.lower().removeprefix("r/") if subreddit else ""
+    if target_post_id and post_id and post_id != target_post_id:
+        return None
+    if target_subreddit and post_subreddit and post_subreddit != target_subreddit:
+        return None
+
+    parts = [f"# {title}"]
+    if source_note:
+        parts.extend(["", f"> {source_note}"])
+    parts.extend(["", "## Thread Metadata", ""])
+    parts.append("- fallback_mode: reddit_json_summary")
+    parts.append("- source_format: reddit_json")
+    if recovery_provider:
+        parts.append(f"- json_recovery_provider: {recovery_provider}")
+    if subreddit:
+        parts.append(f"- subreddit: {subreddit}")
+    if author:
+        parts.append(f"- author: {author}")
+    if score is not None:
+        parts.append(f"- score: {score}")
+    if num_comments is not None:
+        parts.append(f"- comment_count: {num_comments}")
+    if permalink:
+        parts.append(f"- permalink: https://www.reddit.com{permalink}")
+    parts.append(f"- json_source_url: {_build_reddit_json_fallback_url(url) or url}")
+    parts.append("")
+    if body and body not in {"[removed]", "[deleted]"}:
+        parts.extend(["## Post Body", "", body, ""])
+    else:
+        parts.extend([
+            "## Post Body",
+            "",
+            "The Reddit JSON endpoint exposed the thread metadata, but the post body is unavailable.",
+            "",
+        ])
+    return "\n".join(parts).strip()
+
+
+def _select_best_reddit_search_recovery_result(results: list[dict[str, Any]], target_url: str) -> dict[str, Any] | None:
+    reliable = [item for item in results if _is_reliable_reddit_search_recovery_result(item, target_url)]
+    if not reliable:
+        return None
+
+    target_signals = _extract_reddit_recovery_signals(target_url)
+    target_path = str(target_signals.get("path") or "")
+    target_post_id = str(target_signals.get("post_id") or "")
+    target_subreddit = str(target_signals.get("subreddit") or "").lower()
+
+    def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        item_url = str(item.get("url") or "").strip()
+        item_signals = _extract_reddit_recovery_signals(item_url)
+        exact_url = int(bool(item_url and item_url == target_url))
+        same_path = int(bool(target_path and item_signals.get("path") == target_path))
+        same_post_id = int(bool(target_post_id and item_signals.get("post_id") == target_post_id))
+        same_subreddit = int(
+            bool(
+                target_subreddit
+                and str(item_signals.get("subreddit") or "").lower() == target_subreddit
+            )
+        )
+        slug_overlap = _reddit_search_recovery_slug_overlap(target_url, item)
+        content_length = len(str(item.get("content") or ""))
+        title_length = len(str(item.get("title") or ""))
+        score = float(item.get("score") or 0)
+        return (exact_url, same_path, same_post_id, same_subreddit, slug_overlap, content_length, title_length, score)
+
+    return max(reliable, key=sort_key)
+
+
+def _select_best_search_recovery_result(results: list[dict[str, Any]], target_url: str) -> dict[str, Any] | None:
+    if not results:
+        return None
+
+    target_domain = _normalized_fetch_domain(target_url)
+    if target_domain == "reddit.com" or target_domain.endswith(".reddit.com"):
+        return _select_best_reddit_search_recovery_result(results, target_url)
+
+    target_path = ""
+    try:
+        target_path = urlparse(target_url).path or ""
+    except ValueError:
+        target_path = ""
+
+    def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        item_url = item.get("url", "")
+        item_domain = _normalized_fetch_domain(item_url)
+        item_path = ""
+        try:
+            item_path = urlparse(item_url).path or ""
+        except ValueError:
+            item_path = ""
+
+        exact_url = int(bool(item_url and item_url == target_url))
+        same_path = int(bool(target_path and item_path == target_path))
+        same_domain = int(bool(target_domain and item_domain == target_domain))
+        content_length = len(item.get("content") or "")
+        title_length = len(item.get("title") or "")
+        score = float(item.get("score") or 0)
+        return (exact_url, same_path, same_domain, content_length, title_length, score)
+
+    return max(results, key=sort_key)
+
+
+def _is_substantive_fetch_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if stripped.startswith(("---", "|", ">")):
+        return False
+    if lowered.startswith(("- ", "* ", "1. ", "2. ", "3. ", "http://", "https://", "source_url:", "inferred_title:", "fetch_structure_version:")):
+        return False
+    if len(stripped) >= 60:
+        return True
+    cjk_chars = sum(1 for ch in stripped if "\u4e00" <= ch <= "\u9fff")
+    return cjk_chars >= 24
+
+
+def _analyze_fetch_content(text: str | None, url: str | None = None) -> dict[str, Any]:
+    content = (text or "").strip()
+    lowered = content.lower()
+    non_empty_lines = [line.strip() for line in content.splitlines() if line.strip()]
+    preview = " ".join(non_empty_lines[:18]).lower()
+    preview_lines = non_empty_lines[:18]
+    marker_hits = sum(1 for marker in _LOW_QUALITY_FETCH_MARKERS if marker in lowered)
+    preview_hits = sum(1 for marker in _LOW_QUALITY_FETCH_MARKERS if marker in preview)
+    domain_markers = _domain_specific_fetch_markers(url)
+    domain_hits = sum(1 for marker in domain_markers if marker.lower() in lowered)
+    domain_preview_hits = sum(1 for marker in domain_markers if marker.lower() in preview)
+    ui_line_hits = sum(
+        1
+        for line in preview_lines
+        if any(line.lower().startswith(prefix) for prefix in _LOW_QUALITY_UI_PREFIXES)
+    )
+    heading_count = sum(1 for line in non_empty_lines if line.startswith("#"))
+    substantive_line_count = sum(1 for line in non_empty_lines if _is_substantive_fetch_line(line))
+    sentence_hits = len(re.findall(r"[。！？.!?]", content))
+    code_block_count = content.count("```") // 2
+    has_table = "| ---" in content or "<table" in lowered
+    strong_content_signals = heading_count >= 1 or substantive_line_count >= 2 or sentence_hits >= 3 or code_block_count >= 1 or has_table
+
+    return {
+        "content": content,
+        "content_length": len(content),
+        "non_empty_lines": non_empty_lines,
+        "preview": preview,
+        "preview_lines": preview_lines,
+        "marker_hits": marker_hits,
+        "preview_hits": preview_hits,
+        "domain_hits": domain_hits,
+        "domain_preview_hits": domain_preview_hits,
+        "ui_line_hits": ui_line_hits,
+        "heading_count": heading_count,
+        "substantive_line_count": substantive_line_count,
+        "sentence_hits": sentence_hits,
+        "code_block_count": code_block_count,
+        "has_table": has_table,
+        "strong_content_signals": strong_content_signals,
+        "word_count": _word_count(content),
+        "domain": _normalized_fetch_domain(url),
+    }
+
+
+def _is_low_quality_fetch_result(
+    text: str | None,
+    url: str | None = None,
+    analysis: dict[str, Any] | None = None,
+) -> bool:
+    stats = analysis or _analyze_fetch_content(text, url)
+    if not stats["content"]:
+        return True
+
+    if stats["content_length"] < 400 and stats["marker_hits"] >= 1:
+        return True
+    if stats["content_length"] < 1400 and stats["preview_hits"] >= 2:
+        return True
+    if stats["content_length"] < 2500 and stats["marker_hits"] >= 4:
+        return True
+    if stats["content_length"] < 500 and stats["substantive_line_count"] == 0 and not stats["strong_content_signals"]:
+        return True
+    if stats["ui_line_hits"] >= 4 and not stats["strong_content_signals"]:
+        return True
+    if (
+        stats["preview_hits"] >= 2
+        and stats["substantive_line_count"] <= 1
+        and stats["sentence_hits"] <= 2
+        and stats["content_length"] < 4000
+    ):
+        return True
+    if stats["domain_preview_hits"] >= 2 and stats["substantive_line_count"] <= 2 and stats["heading_count"] <= 1:
+        return True
+    if stats["domain_hits"] >= 3 and not stats["strong_content_signals"]:
+        return True
+    return False
+
+
+_FETCH_PROVIDER_PREFERENCE = {
+    "exa": 3,
+    "firecrawl": 2,
+    "tavily": 1,
+    "site_fallback": 1,
+}
+
+_HTML_TITLE_PATTERN = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+def _build_fetch_candidate(provider: str, text: str | None, url: str) -> dict[str, Any] | None:
+    analysis = _analyze_fetch_content(text, url)
+    content = analysis["content"]
+    if not content:
+        return None
+
+    is_low_quality = _is_low_quality_fetch_result(content, url, analysis)
+    score = 0.0
+    score += min(analysis["content_length"], 12000) / 260.0
+    score += min(analysis["substantive_line_count"], 18) * 2.4
+    score += min(analysis["heading_count"], 6) * 1.8
+    score += min(analysis["sentence_hits"], 24) * 0.6
+    score += min(analysis["code_block_count"], 4) * 2.0
+    if analysis["has_table"]:
+        score += 2.5
+    score += min(analysis["word_count"], 1200) / 180.0
+    score += _FETCH_PROVIDER_PREFERENCE.get(provider, 0) * 0.4
+    domain = _normalized_fetch_domain(url)
+    if domain == "github.com" or domain.endswith(".github.com"):
+        if provider == "firecrawl":
+            score -= 4.0
+        elif provider in {"exa", "tavily"}:
+            score += 1.0
+    score -= analysis["marker_hits"] * 2.6
+    score -= analysis["preview_hits"] * 1.8
+    score -= analysis["domain_hits"] * 2.2
+    score -= analysis["domain_preview_hits"] * 2.8
+    score -= analysis["ui_line_hits"] * 3.0
+    if is_low_quality:
+        score -= 24.0
+
+    return {
+        "provider": provider,
+        "content": content,
+        "score": score,
+        "is_low_quality": is_low_quality,
+        "analysis": analysis,
+    }
+
+
+def _select_best_fetch_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    allow_low_quality: bool = False,
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+
+    pool = candidates if allow_low_quality else [candidate for candidate in candidates if not candidate["is_low_quality"]]
+    if not pool:
+        return None
+
+    return max(
+        pool,
+        key=lambda candidate: (
+            candidate["score"],
+            candidate["analysis"]["content_length"],
+            candidate["analysis"]["substantive_line_count"],
+            _FETCH_PROVIDER_PREFERENCE.get(candidate["provider"], 0),
+        ),
+    )
+
+
 async def _call_tavily_extract(url: str) -> str | None:
     import httpx
     api_url = config.tavily_api_url
@@ -1936,7 +2858,7 @@ async def _call_tavily_extract(url: str) -> str | None:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {"urls": [url], "format": "markdown"}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -1944,7 +2866,244 @@ async def _call_tavily_extract(url: str) -> str | None:
                 content = data["results"][0].get("raw_content", "")
                 return content if content and content.strip() else None
             return None
-    except Exception:
+    except Exception as e:
+        await log_info(None, f"Tavily extract error: {e}", config.debug_enabled)
+        return None
+
+
+async def _fetch_raw_html(url: str, ctx=None) -> str | None:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            headers=_FETCH_FALLBACK_HEADERS,
+            follow_redirects=True,
+            trust_env=False,
+        ) as client:
+            response = await client.get(url)
+            text = response.text
+            if text and text.strip():
+                return text
+            response.raise_for_status()
+            return None
+    except Exception as e:
+        await log_info(ctx, f"Raw HTML fallback error: {e}", config.debug_enabled)
+        return None
+
+
+async def _fetch_reddit_json_fallback(url: str, ctx=None) -> str | None:
+    import httpx
+
+    fallback_url = _build_reddit_json_fallback_url(url)
+    if not fallback_url:
+        return None
+
+    headers = dict(_FETCH_FALLBACK_HEADERS)
+    headers["Accept"] = "application/json,text/plain,*/*"
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            headers=headers,
+            follow_redirects=True,
+            trust_env=False,
+        ) as client:
+            response = await client.get(fallback_url)
+            response.raise_for_status()
+            text = response.text
+            if text and text.strip():
+                return text
+            return None
+    except Exception as e:
+        await log_info(ctx, f"Reddit JSON fallback error: {e}", config.debug_enabled)
+        return None
+
+
+async def _recover_reddit_json_fallback_markdown(url: str, ctx=None) -> str | None:
+    fallback_url = _build_reddit_json_fallback_url(url)
+    if not fallback_url:
+        return None
+
+    source_note = "目标页被 Reddit 反爬拦截，回退为同帖 JSON 元数据摘要。"
+    provider_attempts = [
+        ("direct_json", await _fetch_reddit_json_fallback(url, ctx)),
+        ("tavily_json", await _call_tavily_extract(fallback_url)),
+        ("exa_json", await _call_exa_contents(fallback_url, ctx)),
+        ("firecrawl_json", await _call_firecrawl_scrape(fallback_url, ctx)),
+    ]
+    for provider, text in provider_attempts:
+        markdown = _build_reddit_json_fallback_markdown(
+            url,
+            text,
+            source_note,
+            recovery_provider=provider,
+        )
+        if markdown:
+            return markdown
+    return None
+
+
+async def _build_site_fetch_fallback_candidate(url: str, ctx=None) -> dict[str, Any] | None:
+    if not _should_try_site_fetch_fallback(url):
+        return None
+
+    domain = _normalized_fetch_domain(url)
+    title = ""
+    description = ""
+    meta_markdown = None
+
+    async def recover_via_search(note: str) -> str | None:
+        candidates: list[dict[str, Any]] = []
+        if domain.endswith("reddit.com"):
+            queries = _build_reddit_search_recovery_queries(url)
+        elif domain.endswith("zhihu.com"):
+            queries = _build_zhihu_search_recovery_queries(url)
+        else:
+            queries = (f"site:{domain} {url}",)
+
+        for query in queries:
+            exa_results, tavily_results, firecrawl_results = await asyncio.gather(
+                _call_exa_search(query, max_results=3, ctx=ctx),
+                _call_tavily_search(query, max_results=3),
+                _call_firecrawl_search(query, limit=3),
+            )
+            if exa_results:
+                candidates.extend(exa_results)
+            if tavily_results:
+                candidates.extend(
+                    item
+                    for item in (
+                        _normalize_search_recovery_result("tavily_search", result)
+                        for result in tavily_results
+                    )
+                    if item
+                )
+            if firecrawl_results:
+                candidates.extend(
+                    item
+                    for item in (
+                        _normalize_search_recovery_result("firecrawl_search", result)
+                        for result in firecrawl_results
+                    )
+                    if item
+                )
+
+        if domain.endswith("zhihu.com"):
+            candidates = [item for item in candidates if _is_reliable_zhihu_search_recovery_result(item, url)]
+
+        best = _select_best_search_recovery_result(candidates, url)
+        if not best:
+            return None
+        return _build_meta_summary_markdown(
+            url,
+            best.get("title", "") or title,
+            best.get("content", "") or description,
+            note,
+        )
+
+    if domain.endswith("reddit.com"):
+        reddit_json_markdown = await _recover_reddit_json_fallback_markdown(url, ctx)
+        if reddit_json_markdown:
+            return _build_fetch_candidate("site_fallback", reddit_json_markdown, url)
+
+    raw_html = await _fetch_raw_html(url, ctx)
+    if not raw_html:
+        if domain.endswith("github.com"):
+            meta_markdown = await recover_via_search("目标页抓取失败，尝试从搜索结果恢复 GitHub 页面摘要。")
+            if not meta_markdown:
+                return None
+            return _build_fetch_candidate("site_fallback", meta_markdown, url)
+        if domain.endswith("reddit.com"):
+            meta_markdown = await recover_via_search("目标页抓取失败，尝试从搜索结果恢复摘要。")
+            if not meta_markdown:
+                meta_markdown = _build_reddit_identity_summary_markdown(
+                    url,
+                    "目标页抓取失败；未恢复到同帖公开摘要，回退为 URL 标识摘要。",
+                )
+            return _build_fetch_candidate("site_fallback", meta_markdown, url) if meta_markdown else None
+        if domain.endswith("zhihu.com"):
+            meta_markdown = await recover_via_search("目标页抓取失败，尝试从搜索结果恢复摘要。")
+            if not meta_markdown:
+                meta_markdown = _build_zhihu_identity_summary_markdown(
+                    url,
+                    "目标页抓取失败，回退为 URL 标识摘要。",
+                )
+            return _build_fetch_candidate("site_fallback", meta_markdown, url) if meta_markdown else None
+        return None
+
+    title = _extract_html_title(raw_html)
+    description = (
+        _extract_meta_content(raw_html, "description")
+        or _extract_meta_content(raw_html, "og:description")
+        or _extract_meta_content(raw_html, "twitter:description")
+    )
+    title = (
+        title
+        or _extract_meta_content(raw_html, "og:title")
+        or _extract_meta_content(raw_html, "twitter:title")
+    )
+    lowered = raw_html.lower()
+
+    if domain.endswith("juejin.cn"):
+        if title and title != "找不到页面":
+            meta_markdown = _build_meta_summary_markdown(
+                url,
+                title,
+                description,
+                "页面正文受限，回退为页面元信息摘要。",
+            )
+    elif domain.endswith("github.com"):
+        if title or description:
+            meta_markdown = _build_meta_summary_markdown(
+                url,
+                title or "GitHub page",
+                description,
+                "GitHub 页面启用站点级元信息回退。",
+            )
+    elif domain.endswith("reddit.com"):
+        if "you've been blocked by network security" in lowered or "please wait for verification" in lowered:
+            meta_markdown = await recover_via_search("目标页被反爬拦截，回退为搜索结果摘要。")
+            if not meta_markdown:
+                meta_markdown = _build_reddit_identity_summary_markdown(
+                    url,
+                    "目标页被反爬拦截；未恢复到同帖公开摘要，回退为 URL 标识摘要。",
+                )
+    elif domain.endswith("zhihu.com"):
+        if "欢迎来到知乎，发现问题背后的世界" in raw_html or "请求存在异常" in raw_html:
+            meta_markdown = await recover_via_search("目标页被知乎风控拦截，回退为搜索结果摘要。")
+            if not meta_markdown:
+                meta_markdown = _build_zhihu_identity_summary_markdown(
+                    url,
+                    "目标页被知乎风控拦截；未恢复到可验证公开摘要，回退为 URL 标识摘要。",
+                )
+
+    if not meta_markdown:
+        return None
+
+    return _build_fetch_candidate("site_fallback", meta_markdown, url)
+
+
+async def _call_exa_contents(url: str, ctx=None) -> str | None:
+    import httpx
+    api_url = config.exa_api_url
+    api_key = config.exa_api_key
+    if not config.exa_enabled or not api_key:
+        return None
+    endpoint = f"{api_url.rstrip('/')}/contents"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    body = {"urls": [url], "text": True}
+    try:
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            response = await client.post(endpoint, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results") or []
+            if not results:
+                return None
+            content = results[0].get("text", "")
+            return content if isinstance(content, str) and content.strip() else None
+    except Exception as e:
+        await log_info(ctx, f"Exa error: {e}", config.debug_enabled)
         return None
 
 
@@ -1963,7 +3122,7 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | 
         "include_answer": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -1976,6 +3135,33 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | 
         return None
 
 
+async def _call_exa_search(query: str, max_results: int = 6, ctx=None) -> list[dict] | None:
+    import httpx
+
+    api_url = config.exa_api_url
+    api_key = config.exa_api_key
+    if not config.exa_enabled or not api_key:
+        return None
+
+    endpoint = f"{api_url.rstrip('/')}/search"
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    body = {"query": query, "numResults": max_results}
+    try:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.post(endpoint, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results") or []
+            normalized = [
+                _normalize_search_recovery_result("exa_search", item)
+                for item in results
+            ]
+            return [item for item in normalized if item]
+    except Exception as e:
+        await log_info(ctx, f"Exa search error: {e}", config.debug_enabled)
+        return None
+
+
 async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict] | None:
     import httpx
     api_key = config.firecrawl_api_key
@@ -1985,7 +3171,7 @@ async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict] | No
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {"query": query, "limit": limit}
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -2004,6 +3190,10 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
     api_key = config.firecrawl_api_key
     if not api_key:
         return None
+    domain = _normalized_fetch_domain(url)
+    if domain == "github.com" or domain.endswith(".github.com"):
+        await log_info(ctx, "Firecrawl skipped for GitHub URL; prefer Tavily/Exa/raw_html.", config.debug_enabled)
+        return None
     endpoint = f"{api_url.rstrip('/')}/scrape"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     max_retries = config.retry_max_attempts
@@ -2015,7 +3205,7 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
             "waitFor": (attempt + 1) * 1500,
         }
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
                 response = await client.post(endpoint, headers=headers, json=body)
                 response.raise_for_status()
                 data = response.json()
@@ -2056,20 +3246,79 @@ async def web_fetch(
 
     await log_info(ctx, f"Begin Fetch: {url}", config.debug_enabled)
 
-    result = await _call_tavily_extract(url)
-    if result:
-        await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return augment_fetched_markdown(url, result)
+    candidates: list[dict[str, Any]] = []
 
-    await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
-    result = await _call_firecrawl_scrape(url, ctx)
-    if result:
-        await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
-        return augment_fetched_markdown(url, result)
+    tavily_result, firecrawl_result, exa_result = await asyncio.gather(
+        _call_tavily_extract(url),
+        _call_firecrawl_scrape(url, ctx),
+        _call_exa_contents(url, ctx),
+    )
+
+    tavily_candidate = _build_fetch_candidate("tavily", tavily_result, url)
+    if tavily_candidate:
+        candidates.append(tavily_candidate)
+        await log_info(
+            ctx,
+            f"Tavily candidate collected: score={tavily_candidate['score']:.1f}, low_quality={tavily_candidate['is_low_quality']}",
+            config.debug_enabled,
+        )
+    else:
+        await log_info(ctx, "Tavily unavailable or failed.", config.debug_enabled)
+
+    firecrawl_candidate = _build_fetch_candidate("firecrawl", firecrawl_result, url)
+    if firecrawl_candidate:
+        candidates.append(firecrawl_candidate)
+        await log_info(
+            ctx,
+            f"Firecrawl candidate collected: score={firecrawl_candidate['score']:.1f}, low_quality={firecrawl_candidate['is_low_quality']}",
+            config.debug_enabled,
+        )
+    else:
+        await log_info(ctx, "Firecrawl unavailable or failed.", config.debug_enabled)
+
+    exa_candidate = _build_fetch_candidate("exa", exa_result, url)
+    if exa_candidate:
+        candidates.append(exa_candidate)
+        await log_info(
+            ctx,
+            f"Exa candidate collected: score={exa_candidate['score']:.1f}, low_quality={exa_candidate['is_low_quality']}",
+            config.debug_enabled,
+        )
+    else:
+        await log_info(ctx, "Exa unavailable or failed.", config.debug_enabled)
+
+    best_candidate = _select_best_fetch_candidate(candidates)
+    if not best_candidate and _should_try_site_fetch_fallback(url):
+        fallback_candidate = await _build_site_fetch_fallback_candidate(url, ctx)
+        if fallback_candidate:
+            candidates.append(fallback_candidate)
+            best_candidate = _select_best_fetch_candidate(candidates)
+            await log_info(
+                ctx,
+                f"Site fallback candidate collected: score={fallback_candidate['score']:.1f}, low_quality={fallback_candidate['is_low_quality']}",
+                config.debug_enabled,
+            )
+
+    if best_candidate:
+        await log_info(
+            ctx,
+            f"Fetch Finished ({best_candidate['provider'].title()})! selected score={best_candidate['score']:.1f}",
+            config.debug_enabled,
+        )
+        return augment_fetched_markdown(url, best_candidate["content"])
+
+    if candidates:
+        best_low_quality = _select_best_fetch_candidate(candidates, allow_low_quality=True)
+        if best_low_quality:
+            await log_info(
+                ctx,
+                f"All candidates were low-quality; best provider={best_low_quality['provider']} score={best_low_quality['score']:.1f}",
+                config.debug_enabled,
+            )
 
     await log_info(ctx, "Fetch Failed!", config.debug_enabled)
-    if not config.tavily_api_key and not config.firecrawl_api_key:
-        return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
+    if not config.tavily_api_key and not config.firecrawl_api_key and not config.exa_api_key:
+        return "配置错误: TAVILY_API_KEY、FIRECRAWL_API_KEY 和 EXA_API_KEY 均未配置"
     return "提取失败: 所有提取服务均未能获取内容"
 
 
@@ -2087,7 +3336,7 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
     if instructions:
         body["instructions"] = instructions
     try:
-        async with httpx.AsyncClient(timeout=float(timeout + 10)) as client:
+        async with httpx.AsyncClient(timeout=float(timeout + 10), trust_env=False) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -2177,7 +3426,7 @@ async def get_config_info() -> str:
         import time
         start_time = time.time()
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             response = await client.get(
                 models_url,
                 headers={

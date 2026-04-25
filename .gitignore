@@ -8,3 +8,8 @@ src/*.egg-info/
 .env.*
 *.local
 secrets/
+
+# Benchmark artifacts
+benchmarks/live_*.json
+benchmarks/live_fetch_artifacts*/
+*.bak.*

@@ -15,6 +15,7 @@ import sys
 import sysconfig
 import tarfile
 import tempfile
+import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE_REF = "origin/grok-with-tavily"
 DEFAULT_BASELINE_PATH = "/home/rk/.cache/uv/git-v0/checkouts/61eb544e31744e48/8f0ae3c"
+DEFAULT_FETCH_BENCHMARK_FILE = REPO_ROOT / "benchmarks" / "web_fetch_real_urls.txt"
+DEFAULT_CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 ENV_KEYS = [
     "GROK_API_URL",
     "GROK_API_KEY",
@@ -31,12 +34,33 @@ ENV_KEYS = [
     "TAVILY_ENABLED",
     "FIRECRAWL_API_URL",
     "FIRECRAWL_API_KEY",
+    "EXA_API_URL",
+    "EXA_API_KEY",
+    "EXA_ENABLED",
 ]
 LIVE_ENV_KEYS = ENV_KEYS + [
     "GUDA_API_KEY",
     "GUDA_BASE_URL",
     "GROK_MODEL",
 ]
+PROXY_ENV_KEYS = [
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "all_proxy",
+    "no_proxy",
+    "NO_PROXY",
+]
+FINAL_FETCH_METADATA_KEYS = (
+    "source_url",
+    "inferred_title",
+    "fetch_structure_version",
+    "fallback_mode",
+    "source_format",
+    "json_recovery_provider",
+)
 
 
 @dataclass
@@ -81,12 +105,61 @@ def _restore_env(snapshot: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def _stringify_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _load_live_env_from_codex_config(config_path: Path | None = None) -> dict[str, str]:
+    target = config_path or DEFAULT_CODEX_CONFIG_PATH
+    if not target.exists():
+        return {}
+
+    try:
+        data = tomllib.loads(target.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+    server_env = (
+        data.get("mcp_servers", {})
+        .get("grok-search", {})
+        .get("env", {})
+    )
+    if not isinstance(server_env, dict):
+        return {}
+
+    loaded: dict[str, str] = {}
+    for key in LIVE_ENV_KEYS:
+        if key in server_env and server_env[key] is not None:
+            loaded[key] = _stringify_env_value(server_env[key])
+    return loaded
+
+
+def _strip_proxy_env(env: dict[str, str]) -> dict[str, str]:
+    for key in PROXY_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def _prepare_live_env(prefer_existing: bool = True, config_path: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    loaded = _load_live_env_from_codex_config(config_path)
+    if prefer_existing:
+        for key, value in loaded.items():
+            env.setdefault(key, value)
+    else:
+        env.update(loaded)
+    return _strip_proxy_env(env)
+
+
 def _seed_deterministic_env() -> None:
     os.environ["GROK_API_URL"] = "https://api.example.test/v1"
     os.environ["GROK_API_KEY"] = "test-key"
     os.environ["TAVILY_ENABLED"] = "true"
     os.environ.pop("TAVILY_API_KEY", None)
     os.environ.pop("FIRECRAWL_API_KEY", None)
+    os.environ.pop("EXA_API_KEY", None)
     os.environ.pop("GROK_MODEL", None)
 
 
@@ -96,6 +169,117 @@ def _reset_target_state(server_module, tmp_root: Path) -> None:
     server_module.planning_engine._sessions.clear()
     server_module.config._cached_model = None
     server_module.config._config_file = tmp_root / "config.json"
+
+
+def _load_benchmark_urls(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line not in seen:
+            seen.add(line)
+            urls.append(line)
+    return urls
+
+
+_GENERIC_FETCH_SHELL_MARKERS = (
+    "navigation menu",
+    "skip to content",
+    "saved searches",
+    "provide feedback",
+    "sign in",
+    "log in",
+    "open menu",
+    "create account",
+    "get app",
+    "use app",
+    "打开app",
+    "打开 app",
+    "打开知乎 app",
+    "打开知乎app",
+    "登录后查看更多",
+    "登录/注册后",
+    "回到首页",
+    "404 - 您访问的页面不存在",
+    "可能是网址有误",
+    "对应的内容已被删除",
+    "处于私有状态",
+    "please wait for verification",
+    "js_challenge",
+    "need_login=true",
+    "account/unhuman",
+    "找不到页面",
+)
+
+
+def _extract_original_fetch_body(text: str) -> str:
+    marker = "\n## Original Content\n"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+
+def _coerce_final_fetch_metadata_value(key: str, value: str) -> Any:
+    if key == "fetch_structure_version" and value.isdigit():
+        return int(value)
+    return value
+
+
+def _extract_final_fetch_metadata(text: str | None) -> dict[str, Any]:
+    if not isinstance(text, str):
+        return {}
+
+    stripped = text.strip()
+    if not stripped or stripped.startswith(("配置错误:", "提取失败:", "无效URL:")):
+        return {}
+
+    metadata: dict[str, Any] = {}
+    for raw_line in stripped.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = line[2:].strip() if line.startswith("- ") else line
+        for key in FINAL_FETCH_METADATA_KEYS:
+            prefix = f"{key}:"
+            if normalized.startswith(prefix):
+                value = normalized[len(prefix):].strip()
+                if value and key not in metadata:
+                    metadata[key] = _coerce_final_fetch_metadata_value(key, value)
+                break
+    return metadata
+
+
+def _is_failed_fetch_response(text: Any) -> bool:
+    return not isinstance(text, str) or text.startswith(("配置错误:", "提取失败:", "无效URL:"))
+
+
+def _generic_fetch_low_quality(text: str) -> bool:
+    content = text.strip()
+    if not content:
+        return True
+    lowered = content.lower()
+    marker_hits = sum(1 for marker in _GENERIC_FETCH_SHELL_MARKERS if marker in lowered)
+    sentence_hits = sum(content.count(token) for token in (".", "!", "?", "。", "！", "？"))
+    heading_hits = sum(1 for line in content.splitlines() if line.strip().startswith("#"))
+    if len(content) < 500 and marker_hits >= 1:
+        return True
+    if marker_hits >= 3 and sentence_hits <= 2 and heading_hits <= 1:
+        return True
+    return False
+
+
+def _attempt_winner_key(attempt: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        float(attempt.get("score") or 0.0),
+        int(attempt.get("content_length") or 0),
+        -int(bool(attempt.get("low_quality"))),
+        -float(attempt.get("elapsed_s") or 0.0),
+    )
 
 
 async def _probe_validation(server_module, tmp_root: Path) -> list[Probe]:
@@ -381,6 +565,110 @@ async def _probe_fetch_structuring(server_module) -> list[Probe]:
             and "| 2026-01-29 | Au99.99 | 1256.00 |" in result,
             6,
             result[:600],
+            gating=True,
+        )
+    )
+
+    return probes
+
+
+async def _probe_fetch_candidate_selection(server_module) -> list[Probe]:
+    probes: list[Probe] = []
+
+    tavily_content = "# Short Note\n\nBrief summary."
+    firecrawl_content = "\n".join([
+        "# Deep Dive",
+        "",
+        "## Background",
+        "This candidate contains a longer and more substantive explanation of the page body, including details that should make it win the selector.",
+        "",
+        "## Steps",
+        "1. First observe the live behavior.",
+        "2. Then compare the extracted output.",
+        "3. Finally validate the root cause with a clean reproduction.",
+        "",
+        "```text",
+        "important trace details",
+        "```",
+    ])
+
+    original_tavily_extract = server_module._call_tavily_extract
+    original_firecrawl_scrape = server_module._call_firecrawl_scrape
+    original_exa_contents = getattr(server_module, "_call_exa_contents", None)
+    server_module._call_tavily_extract = lambda _url: asyncio.sleep(0, result=tavily_content)
+    server_module._call_firecrawl_scrape = lambda _url, _ctx=None: asyncio.sleep(0, result=firecrawl_content)
+    if original_exa_contents is not None:
+        server_module._call_exa_contents = lambda _url, _ctx=None: asyncio.sleep(0, result=None)
+
+    try:
+        richer_result = await server_module.web_fetch("https://example.com/page")
+    finally:
+        server_module._call_tavily_extract = original_tavily_extract
+        server_module._call_firecrawl_scrape = original_firecrawl_scrape
+        if original_exa_contents is not None:
+            server_module._call_exa_contents = original_exa_contents
+
+    probes.append(
+        Probe(
+            "fetch_selection",
+            "fetch_prefers_richer_candidate_over_shorter_early_result",
+            isinstance(richer_result, str)
+            and "Deep Dive" in richer_result
+            and "Brief summary." not in richer_result,
+            8,
+            richer_result[:600] if isinstance(richer_result, str) else str(richer_result),
+            gating=True,
+        )
+    )
+
+    if not hasattr(server_module, "_build_fetch_candidate") or not hasattr(server_module, "_select_best_fetch_candidate"):
+        probes.append(
+            Probe(
+                "fetch_selection",
+                "fetch_candidate_helpers_available",
+                False,
+                8,
+                "Missing _build_fetch_candidate or _select_best_fetch_candidate",
+                gating=True,
+            )
+        )
+        return probes
+
+    low_quality = server_module._build_fetch_candidate(
+        "tavily",
+        "\n".join([
+            "Navigation Menu",
+            "Skip to content",
+            "Saved searches",
+            "Provide feedback",
+            "Sign in",
+        ]),
+        "https://github.com/org/repo/issues/1",
+    )
+    valid = server_module._build_fetch_candidate(
+        "firecrawl",
+        "\n".join([
+            "# Actual Issue",
+            "",
+            "## Details",
+            "This is the real issue body with meaningful text that should outrank the shell content.",
+            "",
+            "## Notes",
+            "The response includes enough structure to be considered substantive.",
+        ]),
+        "https://github.com/org/repo/issues/1",
+    )
+    winner = server_module._select_best_fetch_candidate([item for item in [low_quality, valid] if item is not None])
+
+    probes.append(
+        Probe(
+            "fetch_selection",
+            "fetch_selector_prefers_non_low_quality_candidate",
+            isinstance(winner, dict)
+            and winner.get("provider") == "firecrawl"
+            and winner.get("is_low_quality") is False,
+            8,
+            json.dumps(winner, ensure_ascii=False)[:600] if winner is not None else "winner=None",
             gating=True,
         )
     )
@@ -953,7 +1241,11 @@ async def _probe_efficiency(server_module) -> list[Probe]:
 
 async def _probe_live_retrieval_robustness(server_module) -> list[Probe]:
     try:
-        has_fetch_backend = bool(server_module.config.tavily_api_key) or bool(server_module.config.firecrawl_api_key)
+        has_fetch_backend = (
+            bool(server_module.config.tavily_api_key)
+            or bool(server_module.config.firecrawl_api_key)
+            or bool(getattr(server_module.config, "exa_api_key", None))
+        )
     except Exception:
         return []
     if not has_fetch_backend:
@@ -1015,6 +1307,276 @@ async def _probe_live_retrieval_robustness(server_module) -> list[Probe]:
         )
 
     return probes
+
+
+async def _probe_live_fetch_benchmark(
+    server_module,
+    benchmark_file: Path,
+    metrics: dict[str, Any] | None = None,
+) -> list[Probe]:
+    if metrics is None:
+        metrics = await _collect_live_fetch_benchmark_metrics(server_module, benchmark_file)
+    if metrics is None:
+        return []
+
+    probes: list[Probe] = []
+    checked_urls = metrics["checked_urls"]
+    successful_urls = metrics["successful_urls"]
+    final_fetch_successful_urls = metrics.get("final_fetch_successful_urls", 0)
+    final_fetch_structured_urls = metrics.get("final_fetch_structured_urls", 0)
+    final_fetch_fallback_urls = metrics.get("final_fetch_fallback_urls", 0)
+    final_fetch_fallback_mode_counts = metrics.get("final_fetch_fallback_mode_counts", {})
+    final_fetch_source_format_counts = metrics.get("final_fetch_source_format_counts", {})
+    final_fetch_recovery_provider_counts = metrics.get("final_fetch_recovery_provider_counts", {})
+    winner_counts = metrics["winner_counts"]
+    summaries = metrics["summaries"]
+
+    probes.append(
+        Probe(
+            "live_fetch_benchmark",
+            "live_fetch_real_url_success_rate",
+            successful_urls >= max(1, len(checked_urls) // 2),
+            8,
+            json.dumps(
+                {
+                    "checked_urls": checked_urls,
+                    "successful_urls": successful_urls,
+                    "winner_counts": winner_counts,
+                },
+                ensure_ascii=False,
+            ),
+            gating=False,
+        )
+    )
+    probes.append(
+        Probe(
+            "live_fetch_benchmark",
+            "live_fetch_final_tool_success_rate",
+            final_fetch_successful_urls >= max(1, len(checked_urls) // 2),
+            8,
+            json.dumps(
+                {
+                    "checked_urls": checked_urls,
+                    "final_fetch_successful_urls": final_fetch_successful_urls,
+                },
+                ensure_ascii=False,
+            ),
+            gating=False,
+        )
+    )
+    probes.append(
+        Probe(
+            "live_fetch_benchmark",
+            "live_fetch_real_url_summary_available",
+            len(summaries) == len(checked_urls),
+            6,
+            json.dumps(summaries, ensure_ascii=False)[:1200],
+            gating=False,
+        )
+    )
+    probes.append(
+        Probe(
+            "live_fetch_benchmark",
+            "live_fetch_structured_metadata_available",
+            final_fetch_structured_urls >= max(1, len(checked_urls) // 2),
+            6,
+            json.dumps(
+                {
+                    "checked_urls": checked_urls,
+                    "final_fetch_structured_urls": final_fetch_structured_urls,
+                    "final_fetch_fallback_urls": final_fetch_fallback_urls,
+                    "final_fetch_fallback_mode_counts": final_fetch_fallback_mode_counts,
+                    "final_fetch_source_format_counts": final_fetch_source_format_counts,
+                    "final_fetch_recovery_provider_counts": final_fetch_recovery_provider_counts,
+                },
+                ensure_ascii=False,
+            ),
+            gating=False,
+        )
+    )
+
+    return probes
+
+
+async def _collect_live_fetch_benchmark_metrics(server_module, benchmark_file: Path) -> dict[str, Any] | None:
+    urls = _load_benchmark_urls(benchmark_file)
+    if not urls:
+        return None
+
+    has_selector = hasattr(server_module, "_build_fetch_candidate") and hasattr(server_module, "_select_best_fetch_candidate")
+    providers: list[str] = []
+    if bool(getattr(server_module.config, "tavily_enabled", False)) and bool(getattr(server_module.config, "tavily_api_key", None)):
+        providers.append("tavily")
+    if bool(getattr(server_module.config, "firecrawl_api_key", None)):
+        providers.append("firecrawl")
+    if bool(getattr(server_module.config, "exa_enabled", False)) and bool(getattr(server_module.config, "exa_api_key", None)):
+        providers.append("exa")
+    if not providers:
+        return None
+
+    checked_urls = urls[: min(5, len(urls))]
+    winner_counts: dict[str, int] = {}
+    successful_urls = 0
+    final_fetch_successful_urls = 0
+    final_fetch_structured_urls = 0
+    final_fetch_fallback_urls = 0
+    final_fetch_fallback_mode_counts: dict[str, int] = {}
+    final_fetch_source_format_counts: dict[str, int] = {}
+    final_fetch_recovery_provider_counts: dict[str, int] = {}
+    summaries: list[dict[str, Any]] = []
+    provider_stats: dict[str, dict[str, Any]] = {
+        provider: {
+            "attempted_urls": 0,
+            "successful_urls": 0,
+            "non_low_quality_urls": 0,
+            "total_length": 0,
+            "total_elapsed_s": 0.0,
+            "winner_count": 0,
+        }
+        for provider in providers
+    }
+    low_quality_urls = 0
+
+    for url in checked_urls:
+        attempts: list[dict[str, Any]] = []
+        url_has_non_low_quality = False
+        for provider in providers:
+            started = asyncio.get_running_loop().time()
+            if provider == "tavily":
+                text = await server_module._call_tavily_extract(url)
+            elif provider == "firecrawl":
+                text = await server_module._call_firecrawl_scrape(url)
+            else:
+                text = await server_module._call_exa_contents(url)
+            elapsed = asyncio.get_running_loop().time() - started
+
+            candidate = None
+            low_quality = None
+            content_length = 0
+            score = None
+            if has_selector:
+                candidate = server_module._build_fetch_candidate(provider, text, url)
+                if candidate is not None:
+                    low_quality = candidate["is_low_quality"]
+                    content_length = candidate["analysis"]["content_length"]
+                    score = round(candidate["score"], 2)
+            elif isinstance(text, str) and not _is_failed_fetch_response(text):
+                body = _extract_original_fetch_body(text)
+                content_length = len(body)
+                low_quality = _generic_fetch_low_quality(body)
+                score = round(content_length / 200.0 - (20.0 if low_quality else 0.0), 2)
+
+            provider_stats[provider]["attempted_urls"] += 1
+            provider_stats[provider]["total_elapsed_s"] += elapsed
+            if content_length > 0:
+                provider_stats[provider]["successful_urls"] += 1
+                provider_stats[provider]["total_length"] += content_length
+            if low_quality is False:
+                provider_stats[provider]["non_low_quality_urls"] += 1
+                url_has_non_low_quality = True
+
+            attempts.append(
+                {
+                    "provider": provider,
+                    "elapsed_s": round(elapsed, 2),
+                    "content_length": content_length,
+                    "low_quality": low_quality,
+                    "score": score,
+                    "candidate": candidate,
+                }
+            )
+
+        winner = None
+        if has_selector:
+            winner = server_module._select_best_fetch_candidate(
+                [attempt["candidate"] for attempt in attempts if attempt["candidate"] is not None]
+            )
+        else:
+            ok_attempts = [attempt for attempt in attempts if attempt["content_length"] > 0 and attempt["low_quality"] is False]
+            if ok_attempts:
+                winner = max(ok_attempts, key=_attempt_winner_key)
+        if winner is not None:
+            successful_urls += 1
+            winner_provider = winner["provider"] if isinstance(winner, dict) else winner.get("provider")
+            winner_counts[winner_provider] = winner_counts.get(winner_provider, 0) + 1
+            provider_stats[winner_provider]["winner_count"] += 1
+        if not url_has_non_low_quality:
+            low_quality_urls += 1
+
+        final_fetch_text = await server_module.web_fetch(url)
+        final_fetch_ok = isinstance(final_fetch_text, str) and not final_fetch_text.startswith(("配置错误:", "提取失败:", "无效URL:"))
+        final_fetch_length = len(final_fetch_text) if final_fetch_ok else 0
+        final_fetch_metadata = _extract_final_fetch_metadata(final_fetch_text if final_fetch_ok else None)
+        if final_fetch_ok and final_fetch_length > 0:
+            final_fetch_successful_urls += 1
+        if final_fetch_metadata:
+            final_fetch_structured_urls += 1
+        fallback_mode = str(final_fetch_metadata.get("fallback_mode") or "").strip()
+        if fallback_mode:
+            final_fetch_fallback_urls += 1
+            final_fetch_fallback_mode_counts[fallback_mode] = final_fetch_fallback_mode_counts.get(fallback_mode, 0) + 1
+        source_format = str(final_fetch_metadata.get("source_format") or "").strip()
+        if source_format:
+            final_fetch_source_format_counts[source_format] = final_fetch_source_format_counts.get(source_format, 0) + 1
+        recovery_provider = str(final_fetch_metadata.get("json_recovery_provider") or "").strip()
+        if recovery_provider:
+            final_fetch_recovery_provider_counts[recovery_provider] = final_fetch_recovery_provider_counts.get(recovery_provider, 0) + 1
+
+        summaries.append(
+            {
+                "url": url,
+                "winner": winner["provider"] if winner is not None else None,
+                "final_fetch_ok": final_fetch_ok,
+                "final_fetch_length": final_fetch_length,
+                "final_fetch_metadata": final_fetch_metadata,
+                "attempts": [
+                    {
+                        "provider": item["provider"],
+                        "elapsed_s": item["elapsed_s"],
+                        "content_length": item["content_length"],
+                        "low_quality": item["low_quality"],
+                        "score": item["score"],
+                    }
+                    for item in attempts
+                ],
+            }
+        )
+
+    provider_summary: dict[str, dict[str, Any]] = {}
+    for provider, stats in provider_stats.items():
+        success_denominator = max(1, stats["attempted_urls"])
+        provider_summary[provider] = {
+            "attempted_urls": stats["attempted_urls"],
+            "successful_urls": stats["successful_urls"],
+            "success_rate": round(stats["successful_urls"] / success_denominator, 3),
+            "non_low_quality_urls": stats["non_low_quality_urls"],
+            "non_low_quality_rate": round(stats["non_low_quality_urls"] / success_denominator, 3),
+            "winner_count": stats["winner_count"],
+            "avg_content_length": round(stats["total_length"] / max(1, stats["successful_urls"]), 1),
+            "avg_elapsed_s": round(stats["total_elapsed_s"] / success_denominator, 2),
+        }
+
+    return {
+        "checked_urls": checked_urls,
+        "provider_order": providers,
+        "successful_urls": successful_urls,
+        "success_rate": round(successful_urls / max(1, len(checked_urls)), 3),
+        "final_fetch_successful_urls": final_fetch_successful_urls,
+        "final_fetch_success_rate": round(final_fetch_successful_urls / max(1, len(checked_urls)), 3),
+        "final_fetch_structured_urls": final_fetch_structured_urls,
+        "final_fetch_structured_rate": round(final_fetch_structured_urls / max(1, len(checked_urls)), 3),
+        "final_fetch_fallback_urls": final_fetch_fallback_urls,
+        "final_fetch_fallback_rate": round(final_fetch_fallback_urls / max(1, len(checked_urls)), 3),
+        "final_fetch_fallback_mode_counts": final_fetch_fallback_mode_counts,
+        "final_fetch_source_format_counts": final_fetch_source_format_counts,
+        "final_fetch_recovery_provider_counts": final_fetch_recovery_provider_counts,
+        "all_low_quality_urls": low_quality_urls,
+        "all_low_quality_rate": round(low_quality_urls / max(1, len(checked_urls)), 3),
+        "winner_counts": winner_counts,
+        "provider_summary": provider_summary,
+        "summaries": summaries,
+        "has_selector": has_selector,
+    }
 
 
 async def _probe_live_latency_and_cost(server_module) -> list[Probe]:
@@ -1197,10 +1759,21 @@ def _failed_gating_probes(categories: dict[str, dict[str, Any]]) -> list[str]:
     return failures
 
 
-async def score_repo(repo_path: Path, include_live: bool) -> dict[str, Any]:
+async def score_repo(repo_path: Path, include_live: bool, benchmark_file: Path | None = None) -> dict[str, Any]:
     score_tmp = Path(tempfile.mkdtemp(prefix="grok-score-"))
-    env_snapshot = _capture_env(LIVE_ENV_KEYS)
+    env_snapshot = _capture_env(LIVE_ENV_KEYS + PROXY_ENV_KEYS)
+    live_env_snapshot = env_snapshot
+    live_fetch_metrics: dict[str, Any] | None = None
     try:
+        if include_live:
+            prepared_live_env = _prepare_live_env(prefer_existing=True)
+            for key, value in prepared_live_env.items():
+                os.environ[key] = value
+            for key in PROXY_ENV_KEYS:
+                if key not in prepared_live_env:
+                    os.environ.pop(key, None)
+            live_env_snapshot = _capture_env(LIVE_ENV_KEYS + PROXY_ENV_KEYS)
+
         server_module, providers_base, providers_grok, sources_module = _load_target(repo_path)
         _seed_deterministic_env()
         _reset_target_state(server_module, score_tmp)
@@ -1210,6 +1783,7 @@ async def score_repo(repo_path: Path, include_live: bool) -> dict[str, Any]:
         probes.extend(await _probe_validation(server_module, score_tmp))
         probes.extend(await _probe_source_quality(server_module, sources_module))
         probes.extend(await _probe_fetch_structuring(server_module))
+        probes.extend(await _probe_fetch_candidate_selection(server_module))
         probes.extend(await _probe_query_quality(providers_grok))
         probes.extend(await _probe_resilience(server_module))
         probes.extend(await _probe_cache_quality(sources_module, score_tmp))
@@ -1220,10 +1794,13 @@ async def score_repo(repo_path: Path, include_live: bool) -> dict[str, Any]:
         probes.extend(await _probe_efficiency(server_module))
         probes.extend(_probe_engineering(repo_path))
         if include_live:
-            _restore_env(env_snapshot)
+            _restore_env(live_env_snapshot)
             _reset_target_state(server_module, score_tmp)
             probes.extend(await _probe_live(server_module))
             probes.extend(await _probe_live_retrieval_robustness(server_module))
+            if benchmark_file is not None:
+                live_fetch_metrics = await _collect_live_fetch_benchmark_metrics(server_module, benchmark_file)
+                probes.extend(await _probe_live_fetch_benchmark(server_module, benchmark_file, live_fetch_metrics))
             probes.extend(await _probe_live_latency_and_cost(server_module))
 
         by_category: dict[str, dict[str, Any]] = {}
@@ -1244,6 +1821,7 @@ async def score_repo(repo_path: Path, include_live: bool) -> dict[str, Any]:
             "total_max_score": total_max_score,
             "categories": by_category,
             "gating_failures": gating_failures,
+            "live_fetch_benchmark": live_fetch_metrics,
         }
     finally:
         _restore_env(env_snapshot)
@@ -1289,7 +1867,7 @@ def _build_subprocess_pythonpath(repo_path: Path) -> str:
     return os.pathsep.join(deduped)
 
 
-def _run_score_subprocess(repo_path: Path, include_live: bool) -> dict[str, Any]:
+def _run_score_subprocess(repo_path: Path, include_live: bool, benchmark_file: Path | None = None) -> dict[str, Any]:
     cmd = [
         sys.executable,
         "-S",
@@ -1299,8 +1877,10 @@ def _run_score_subprocess(repo_path: Path, include_live: bool) -> dict[str, Any]
     ]
     if include_live:
         cmd.append("--include-live")
+    if benchmark_file is not None:
+        cmd.extend(["--benchmark-file", str(benchmark_file)])
 
-    env = os.environ.copy()
+    env = _prepare_live_env(prefer_existing=True) if include_live else os.environ.copy()
     env["PYTHONPATH"] = _build_subprocess_pythonpath(repo_path)
     env["PYTHONNOUSERSITE"] = "1"
 
@@ -1361,6 +1941,91 @@ def compare_scores(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[
     }
 
 
+def compare_live_fetch_benchmark(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any] | None:
+    candidate_metrics = candidate.get("live_fetch_benchmark")
+    baseline_metrics = baseline.get("live_fetch_benchmark")
+    if not candidate_metrics or not baseline_metrics:
+        return None
+
+    candidate_provider_summary = candidate_metrics.get("provider_summary", {})
+    baseline_provider_summary = baseline_metrics.get("provider_summary", {})
+    providers = sorted(set(candidate_provider_summary) | set(baseline_provider_summary))
+
+    provider_deltas: dict[str, Any] = {}
+    for provider in providers:
+        current = candidate_provider_summary.get(provider, {})
+        original = baseline_provider_summary.get(provider, {})
+        provider_deltas[provider] = {
+            "success_rate": {
+                "candidate": current.get("success_rate", 0),
+                "baseline": original.get("success_rate", 0),
+                "delta": round(current.get("success_rate", 0) - original.get("success_rate", 0), 3),
+            },
+            "non_low_quality_rate": {
+                "candidate": current.get("non_low_quality_rate", 0),
+                "baseline": original.get("non_low_quality_rate", 0),
+                "delta": round(current.get("non_low_quality_rate", 0) - original.get("non_low_quality_rate", 0), 3),
+            },
+            "winner_count": {
+                "candidate": current.get("winner_count", 0),
+                "baseline": original.get("winner_count", 0),
+                "delta": current.get("winner_count", 0) - original.get("winner_count", 0),
+            },
+            "avg_content_length": {
+                "candidate": current.get("avg_content_length", 0),
+                "baseline": original.get("avg_content_length", 0),
+                "delta": round(current.get("avg_content_length", 0) - original.get("avg_content_length", 0), 1),
+            },
+            "avg_elapsed_s": {
+                "candidate": current.get("avg_elapsed_s", 0),
+                "baseline": original.get("avg_elapsed_s", 0),
+                "delta": round(current.get("avg_elapsed_s", 0) - original.get("avg_elapsed_s", 0), 2),
+            },
+        }
+
+    return {
+        "checked_urls": candidate_metrics.get("checked_urls", []),
+        "candidate_success_rate": candidate_metrics.get("success_rate", 0),
+        "baseline_success_rate": baseline_metrics.get("success_rate", 0),
+        "success_rate_delta": round(candidate_metrics.get("success_rate", 0) - baseline_metrics.get("success_rate", 0), 3),
+        "candidate_final_fetch_success_rate": candidate_metrics.get("final_fetch_success_rate", 0),
+        "baseline_final_fetch_success_rate": baseline_metrics.get("final_fetch_success_rate", 0),
+        "final_fetch_success_rate_delta": round(
+            candidate_metrics.get("final_fetch_success_rate", 0) - baseline_metrics.get("final_fetch_success_rate", 0),
+            3,
+        ),
+        "candidate_final_fetch_structured_rate": candidate_metrics.get("final_fetch_structured_rate", 0),
+        "baseline_final_fetch_structured_rate": baseline_metrics.get("final_fetch_structured_rate", 0),
+        "final_fetch_structured_rate_delta": round(
+            candidate_metrics.get("final_fetch_structured_rate", 0) - baseline_metrics.get("final_fetch_structured_rate", 0),
+            3,
+        ),
+        "candidate_final_fetch_fallback_rate": candidate_metrics.get("final_fetch_fallback_rate", 0),
+        "baseline_final_fetch_fallback_rate": baseline_metrics.get("final_fetch_fallback_rate", 0),
+        "final_fetch_fallback_rate_delta": round(
+            candidate_metrics.get("final_fetch_fallback_rate", 0) - baseline_metrics.get("final_fetch_fallback_rate", 0),
+            3,
+        ),
+        "candidate_all_low_quality_rate": candidate_metrics.get("all_low_quality_rate", 0),
+        "baseline_all_low_quality_rate": baseline_metrics.get("all_low_quality_rate", 0),
+        "all_low_quality_rate_delta": round(
+            candidate_metrics.get("all_low_quality_rate", 0) - baseline_metrics.get("all_low_quality_rate", 0),
+            3,
+        ),
+        "candidate_winner_counts": candidate_metrics.get("winner_counts", {}),
+        "baseline_winner_counts": baseline_metrics.get("winner_counts", {}),
+        "candidate_final_fetch_fallback_mode_counts": candidate_metrics.get("final_fetch_fallback_mode_counts", {}),
+        "baseline_final_fetch_fallback_mode_counts": baseline_metrics.get("final_fetch_fallback_mode_counts", {}),
+        "candidate_final_fetch_source_format_counts": candidate_metrics.get("final_fetch_source_format_counts", {}),
+        "baseline_final_fetch_source_format_counts": baseline_metrics.get("final_fetch_source_format_counts", {}),
+        "candidate_final_fetch_recovery_provider_counts": candidate_metrics.get("final_fetch_recovery_provider_counts", {}),
+        "baseline_final_fetch_recovery_provider_counts": baseline_metrics.get("final_fetch_recovery_provider_counts", {}),
+        "provider_deltas": provider_deltas,
+        "candidate_has_selector": candidate_metrics.get("has_selector", False),
+        "baseline_has_selector": baseline_metrics.get("has_selector", False),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current grok-search against the original GitHub baseline.")
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
@@ -1368,6 +2033,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-path", default="")
     parser.add_argument("--include-live", action="store_true")
     parser.add_argument("--score-repo", help="Internal mode: score a single repo path and emit JSON.")
+    parser.add_argument("--benchmark-file", default=str(DEFAULT_FETCH_BENCHMARK_FILE))
     return parser.parse_args()
 
 
@@ -1375,7 +2041,8 @@ def main() -> None:
     args = parse_args()
 
     if args.score_repo:
-        result = asyncio.run(score_repo(Path(args.score_repo), args.include_live))
+        benchmark_file = Path(args.benchmark_file).resolve() if args.benchmark_file else None
+        result = asyncio.run(score_repo(Path(args.score_repo), args.include_live, benchmark_file))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
@@ -1388,15 +2055,18 @@ def main() -> None:
         baseline_path = _archive_baseline(repo_root, args.baseline_ref)
     cleanup_baseline = baseline_path != Path(DEFAULT_BASELINE_PATH).resolve() if Path(DEFAULT_BASELINE_PATH).exists() else True
     try:
-        candidate = _run_score_subprocess(repo_root, args.include_live)
-        baseline = _run_score_subprocess(baseline_path, args.include_live)
+        benchmark_file = Path(args.benchmark_file).resolve() if args.benchmark_file else None
+        candidate = _run_score_subprocess(repo_root, args.include_live, benchmark_file)
+        baseline = _run_score_subprocess(baseline_path, args.include_live, benchmark_file)
         comparison = compare_scores(candidate, baseline)
+        live_fetch_comparison = compare_live_fetch_benchmark(candidate, baseline)
         payload = {
             "baseline_path": str(baseline_path),
             "baseline_ref": args.baseline_ref,
             "candidate": candidate,
             "baseline": baseline,
             "comparison": comparison,
+            "live_fetch_comparison": live_fetch_comparison,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     finally:

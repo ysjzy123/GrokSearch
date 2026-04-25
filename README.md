@@ -39,6 +39,7 @@
 这版仓库重点强调几个清晰的改进方向：
 
 - 更稳：输入校验、模型切换校验、错误显式返回、流式失败 fallback
+- 更稳的抓取：`web_fetch` 引入多候选优选、低质量壳页识别、Exa 补充与站点级 fallback
 - 更全：`web_search` 支持预算内多轮聚合与来源补充，默认 `extra_sources=20`
 - 更准：`get_sources` 返回 `search_trace` 与 `evidence_bindings`，方便审计结论与来源
 - 更可用：`Claude / Codex / Gemini` 三端均已验证可接入
@@ -61,7 +62,12 @@ flowchart LR
     WS --> F[Firecrawl Search]
 
     WF --> TE[Tavily Extract]
-    TE -->|失败自动降级| FS[Firecrawl Scrape]
+    WF --> FS[Firecrawl Scrape]
+    WF --> EX[Exa Contents]
+    TE --> SEL[Fetch Candidate Selector]
+    FS --> SEL
+    EX --> SEL
+    SEL --> SF[Site Fallback]
 
     WM --> TM[Tavily Map]
     GS --> CACHE[Sources Cache]
@@ -75,7 +81,7 @@ flowchart LR
 | 精准搜索 | 条件时间上下文注入、模型校验、流式失败自动回退 |
 | 聚合搜索 | Grok + Tavily + Firecrawl 的预算内聚合 |
 | 来源组织 | `sources`、`search_trace`、`evidence_bindings` |
-| 网页抓取 | Tavily Extract 优先，Firecrawl Scrape 托底 |
+| 网页抓取 | Tavily / Firecrawl / Exa 多候选优选，含低质量壳页识别与站点级 fallback |
 | 站点映射 | Tavily Map，适合文档站与仓库入口探索 |
 | 复杂问题规划 | `plan_intent` 到 `plan_execution` 六阶段 |
 | 持久化缓存 | `get_sources` 支持跨进程恢复 |
@@ -96,27 +102,31 @@ flowchart LR
 - 复杂问题更可控：
   - 提供六阶段 `plan_*` 工具，适合复杂检索前先做拆解
 - 抓取链路更稳：
-  - `web_fetch` 优先 Tavily Extract，失败再降级到 Firecrawl Scrape
+  - `web_fetch` 会并发拉取 Tavily / Firecrawl / Exa
+  - 统一做低质量壳页识别与候选优选
+  - 针对 Reddit / Zhihu / Juejin 提供站点级 fallback
 - 客户端接入更直接：
   - 已验证 `Codex`、`Claude`、`Gemini`
 
 ## 本地验证
 
-以下结果来自 **2026-04-09** 的本地回归与真实环境验收。
+当前分支最近一次本地收口验证如下（**2026-04-23**）：
 
 ### 自动化结果
 
 | 项目 | 结果 |
 |------|------|
-| 回归测试 | `22 passed` |
-| 真实环境检查 | 已完成 |
+| `tests/test_regressions.py` | `49 passed` |
+| `tests/test_compare_versions.py` | `3 passed` |
 | 多客户端接入 | `Codex / Claude / Gemini` |
-| gating failures | `0` |
+| live benchmark | 本轮未重跑，使用下方命令复现 |
 
 ### 如何复现
 
 ```bash
 uv run --with pytest --with pytest-asyncio pytest -q
+uv run python scripts/compare_versions.py
+uv run python scripts/compare_versions.py --include-live --benchmark-file benchmarks/web_fetch_real_urls.txt
 ```
 
 ## 安装
@@ -126,7 +136,7 @@ uv run --with pytest --with pytest-asyncio pytest -q
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - 至少一个 OpenAI 兼容的 Grok 接口
-- 可选：Tavily / Firecrawl
+- 可选：Tavily / Firecrawl / Exa
 
 ### 从你的 Fork 安装
 
@@ -157,12 +167,15 @@ uv tool install -e .
 |------|------|--------|------|
 | `GROK_API_URL` | 是 | - | OpenAI 兼容 Grok API 地址 |
 | `GROK_API_KEY` | 是 | - | Grok API Key |
-| `GROK_MODEL` | 否 | `grok-4.1-fast` | 默认模型 |
+| `GROK_MODEL` | 否 | `grok-4.20-fast` | 默认模型 |
 | `TAVILY_API_URL` | 否 | `https://api.tavily.com` | Tavily 地址 |
 | `TAVILY_API_KEY` | 否 | - | Tavily Key |
 | `TAVILY_ENABLED` | 否 | `true` | 是否启用 Tavily |
 | `FIRECRAWL_API_URL` | 否 | `https://api.firecrawl.dev/v2` | Firecrawl 地址 |
 | `FIRECRAWL_API_KEY` | 否 | - | Firecrawl Key |
+| `EXA_API_URL` | 否 | `https://api.exa.ai` | Exa 地址 |
+| `EXA_API_KEY` | 否 | - | Exa Key |
+| `EXA_ENABLED` | 否 | `true` | 是否启用 Exa |
 | `GROK_DEBUG` | 否 | `false` | 调试开关 |
 | `GROK_RETRY_MAX_ATTEMPTS` | 否 | `3` | 最大重试次数 |
 | `GROK_RETRY_MULTIPLIER` | 否 | `1` | 重试退避乘数 |
@@ -188,7 +201,10 @@ claude mcp add-json grok-search --scope user '{
     "TAVILY_API_KEY": "your-tavily-key",
     "TAVILY_ENABLED": "true",
     "FIRECRAWL_API_URL": "https://api.firecrawl.dev/v2",
-    "FIRECRAWL_API_KEY": "your-firecrawl-key"
+    "FIRECRAWL_API_KEY": "your-firecrawl-key",
+    "EXA_API_URL": "https://api.exa.ai",
+    "EXA_API_KEY": "your-exa-key",
+    "EXA_ENABLED": "true"
   }
 }'
 ```
@@ -210,6 +226,9 @@ TAVILY_API_KEY = "your-tavily-key"
 TAVILY_ENABLED = "true"
 FIRECRAWL_API_URL = "https://api.firecrawl.dev/v2"
 FIRECRAWL_API_KEY = "your-firecrawl-key"
+EXA_API_URL = "https://api.exa.ai"
+EXA_API_KEY = "your-exa-key"
+EXA_ENABLED = "true"
 ```
 
 ### Gemini CLI
@@ -229,7 +248,10 @@ FIRECRAWL_API_KEY = "your-firecrawl-key"
         "TAVILY_API_KEY": "your-tavily-key",
         "TAVILY_ENABLED": "true",
         "FIRECRAWL_API_URL": "https://api.firecrawl.dev/v2",
-        "FIRECRAWL_API_KEY": "your-firecrawl-key"
+        "FIRECRAWL_API_KEY": "your-firecrawl-key",
+        "EXA_API_URL": "https://api.exa.ai",
+        "EXA_API_KEY": "your-exa-key",
+        "EXA_ENABLED": "true"
       }
     }
   }
@@ -280,8 +302,10 @@ FIRECRAWL_API_KEY = "your-firecrawl-key"
    - Tavily / Firecrawl 补结构化来源
    - `evidence_bindings` 尽量把 claim 对齐到更具体的 source
 
-4. **抓取链路必须有托底**
-   - Tavily Extract 失败后自动降级到 Firecrawl Scrape
+4. **抓取链路必须有优选与托底**
+   - `web_fetch` 会并发收集 Tavily / Firecrawl / Exa 候选
+   - 过滤明显壳页后再做优选
+   - 对 Reddit / Zhihu / Juejin 等站点补站点级 fallback
 
 5. **复杂搜索先规划，再执行**
    - `plan_*` 六阶段专门用于复杂研究类问题
@@ -300,6 +324,31 @@ uv sync
 uv run --with pytest --with pytest-asyncio pytest -q
 ```
 
+### 版本对比与 live 验证
+
+```bash
+uv run python scripts/compare_versions.py
+uv run python scripts/compare_versions.py --include-live
+uv run python scripts/compare_versions.py --include-live --benchmark-file benchmarks/web_fetch_real_urls.txt
+```
+
+### `web_fetch` 真实 URL benchmark
+
+```bash
+uv run python scripts/benchmark_web_fetch.py \
+  --url-file benchmarks/web_fetch_real_urls.txt \
+  --json-out benchmarks/live_fetch_benchmark_result.json
+```
+
+如需保留各 provider 原始输出以便人工抽查，可再加：
+
+```bash
+uv run python scripts/benchmark_web_fetch.py \
+  --url-file benchmarks/web_fetch_real_urls.txt \
+  --json-out benchmarks/live_fetch_benchmark_result.json \
+  --artifact-dir benchmarks/live_fetch_artifacts
+```
+
 ### 关键文件
 
 | 路径 | 用途 |
@@ -307,6 +356,9 @@ uv run --with pytest --with pytest-asyncio pytest -q
 | `src/grok_search/server.py` | MCP 工具入口与主流程 |
 | `src/grok_search/providers/grok.py` | Grok provider |
 | `src/grok_search/sources.py` | 来源缓存与来源拆分 |
+| `scripts/compare_versions.py` | 基线对比、deterministic/live 评分 |
+| `scripts/benchmark_web_fetch.py` | `web_fetch` 多 provider 真实 URL 基准脚本 |
+| `benchmarks/web_fetch_real_urls.txt` | 默认真实 URL 样本集 |
 | `tests/test_regressions.py` | 回归测试 |
 | `docs/improvement-workflow.md` | 改进与验收工作流 |
 
@@ -327,6 +379,30 @@ uv run --with pytest --with pytest-asyncio pytest -q
 ```bash
 uv tool install --from git+https://github.com/<yourname>/GrokSearch@grok-with-tavily grok-search
 ```
+
+### `web_fetch` 现在如何决定最终输出？
+
+默认会并发尝试 `Tavily Extract`、`Firecrawl Scrape`、`Exa Contents`。
+
+随后流程是：
+
+1. 对候选内容做低质量壳页识别
+2. 在非低质量候选中按内容强度和 provider 偏好做优选
+3. 若目标站点命中特殊拦截，再进入站点级 fallback
+
+当前已内置特殊处理的站点包括：`Reddit`、`Zhihu`、`Juejin`。
+
+### benchmark 目录里哪些该提交、哪些不该提交？
+
+建议只保留：
+
+- `benchmarks/web_fetch_real_urls.txt`
+- 你自己明确想长期保留的样本说明文件
+
+以下通常都是运行产物，不建议提交：
+
+- `benchmarks/live_fetch_artifacts*/`
+- `benchmarks/live_*.json`
 
 ### 这是不是通用 agent 框架？
 

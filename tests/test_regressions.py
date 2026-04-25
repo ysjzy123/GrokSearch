@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from grok_search import server
-from grok_search.fetch_processing import augment_fetched_markdown, extract_html_tables
+from grok_search.fetch_processing import augment_fetched_markdown, extract_html_tables, infer_title
 from grok_search.providers.base import BaseSearchProvider
 from grok_search.providers.grok import GrokSearchProvider
 from grok_search.sources import split_answer_and_sources
@@ -26,6 +26,7 @@ def reset_global_state(monkeypatch, tmp_path):
     monkeypatch.setenv("GROK_SOURCES_CACHE_DIR", str(tmp_path / "sources-cache"))
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
     monkeypatch.delenv("GROK_MODEL", raising=False)
 
     server._AVAILABLE_MODELS_CACHE.clear()
@@ -276,6 +277,68 @@ def test_augment_fetched_markdown_adds_source_metadata_and_original_content():
     assert content in result
 
 
+def test_augment_fetched_markdown_normalizes_reddit_json_payload():
+    content = json.dumps(
+        [
+            {
+                "kind": "Listing",
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t3",
+                            "data": {
+                                "title": "What are you building with Python this week?",
+                                "subreddit_name_prefixed": "r/Python",
+                                "author": "weekly-bot",
+                                "selftext": "Share your projects and progress.",
+                                "score": 42,
+                                "num_comments": 9,
+                                "permalink": "/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/",
+                            },
+                        }
+                    ]
+                },
+            },
+            {"kind": "Listing", "data": {"children": []}},
+        ],
+        ensure_ascii=False,
+    )
+
+    result = augment_fetched_markdown("https://www.reddit.com/comments/1c5qg8q/.json?raw_json=1", content)
+
+    assert "inferred_title: What are you building with Python this week?" in result
+    assert "source_format: reddit_json" in result
+    assert "subreddit: r/Python" in result
+    assert "Share your projects and progress." in result
+    assert '"kind": "Listing"' not in result
+
+
+def test_infer_title_skips_yaml_metadata_fields():
+    content = "\n".join([
+        "source_url: https://github.com/lsdefine/GenericAgent/tree/main",
+        "inferred_title: main",
+        "",
+        "# lsdefine/GenericAgent",
+        "",
+        "Repository body",
+    ])
+
+    assert infer_title(content, "https://github.com/lsdefine/GenericAgent/tree/main") == "lsdefine/GenericAgent"
+
+
+def test_infer_title_prefers_github_heading_over_shell_text():
+    content = "\n".join([
+        "Skip to content",
+        "Search or jump to...",
+        "",
+        "# lsdefine/GenericAgent",
+        "",
+        "Repository body",
+    ])
+
+    assert infer_title(content, "https://github.com/lsdefine/GenericAgent/tree/main") == "lsdefine/GenericAgent"
+
+
 def test_extract_html_tables_normalizes_header_and_rows():
     html = (
         "<table><tr><th>日期</th><th>合约</th><th>最高价</th></tr>"
@@ -293,6 +356,7 @@ def test_extract_html_tables_normalizes_header_and_rows():
 async def test_web_fetch_wraps_result_with_extraction_aids(monkeypatch):
     monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result="# Example\n\n| A | B |\n| --- | --- |\n| 1 | 2 |"))
     monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
 
     result = await server.web_fetch("https://example.com/page")
 
@@ -300,6 +364,709 @@ async def test_web_fetch_wraps_result_with_extraction_aids(monkeypatch):
     assert "## Extraction Aids" in result
     assert "### Normalized Tables" in result
     assert "## Original Content" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_exa_when_other_extractors_fail(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result="# Exa Title\n\nBody"))
+
+    result = await server.web_fetch("https://example.com/page")
+
+    assert "source_url: https://example.com/page" in result
+    assert "## Original Content" in result
+    assert "# Exa Title" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_falls_back_to_exa_when_tavily_result_is_low_quality(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result="# Navigation Menu\n\nSaved searches\n\nProvide feedback"))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result="# Actual Issue Title\n\nUseful discussion body"))
+
+    result = await server.web_fetch("https://example.com/page")
+
+    assert "Actual Issue Title" in result
+    assert "Navigation Menu" not in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_selects_richer_firecrawl_candidate_over_short_tavily(monkeypatch):
+    tavily_content = "# Short Note\n\nBrief summary."
+    firecrawl_content = "\n".join([
+        "# Deep Dive",
+        "",
+        "## Background",
+        "This candidate contains a longer and more substantive explanation of the page body, including details that should make it win the selector.",
+        "",
+        "## Steps",
+        "1. First observe the live behavior.",
+        "2. Then compare the extracted output.",
+        "3. Finally validate the root cause with a clean reproduction.",
+        "",
+        "```text",
+        "important trace details",
+        "```",
+    ])
+
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=tavily_content))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=firecrawl_content))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://example.com/page")
+
+    assert "Deep Dive" in result
+    assert "Brief summary." not in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_juejin_metadata_fallback_when_extractors_fail(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(
+            0,
+            result=(
+                "<html><head>"
+                "<title>Juejin Live Article - 掘金</title>"
+                '<meta name="description" content="This article explains how to automate publishing across platforms.">'
+                "</head></html>"
+            ),
+        ),
+    )
+
+    result = await server.web_fetch("https://juejin.cn/post/7629183326780276763")
+
+    assert "Juejin Live Article - 掘金" in result
+    assert "fallback_mode: metadata_summary" in result
+    assert "页面正文受限，回退为页面元信息摘要。" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_github_metadata_fallback_when_extractors_fail(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(
+            0,
+            result=(
+                "<html><head>"
+                "<title>GitHub - lsdefine/GenericAgent: Self-evolving agent · GitHub</title>"
+                '<meta name="description" content="Self-evolving agent: grows skill tree from 3.3K-line seed.">'
+                "</head></html>"
+            ),
+        ),
+    )
+
+    result = await server.web_fetch("https://github.com/lsdefine/GenericAgent/tree/main")
+
+    assert "GitHub - lsdefine/GenericAgent: Self-evolving agent · GitHub" in result
+    assert "Self-evolving agent: grows skill tree from 3.3K-line seed." in result
+    assert "GitHub 页面启用站点级元信息回退。" in result
+
+
+@pytest.mark.asyncio
+async def test_firecrawl_scrape_skips_github_urls(monkeypatch):
+    import httpx
+
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "f-key")
+
+    class FailIfConstructed:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("httpx.AsyncClient should not be constructed for GitHub scrape")
+
+    monkeypatch.setattr(httpx, "AsyncClient", FailIfConstructed)
+
+    result = await server._call_firecrawl_scrape("https://github.com/lsdefine/GenericAgent/tree/main")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_reddit_search_fallback_when_page_is_blocked(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(0, result="<html><body>You've been blocked by network security.</body></html>"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_call_tavily_search",
+        lambda _query, max_results=3: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "title": "What are you building with Python this week?",
+                    "url": "https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/",
+                    "content": "Weekly discussion thread for Python builders sharing projects and progress.",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/")
+
+    assert "What are you building with Python this week?" in result
+    assert "Weekly discussion thread for Python builders" in result
+    assert "目标页被反爬拦截，回退为搜索结果摘要。" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_zhihu_search_fallback_when_page_is_blocked(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(
+            0,
+            result="<html><body>知乎，让每一次点击都充满意义 —— 欢迎来到知乎，发现问题背后的世界。</body></html>",
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_call_tavily_search",
+        lambda _query, max_results=3: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "title": "如何评价某个问题的最佳实践 - 知乎",
+                    "url": "https://www.zhihu.com/question/649365581",
+                    "content": "该问题讨论了实践方式、取舍以及常见误区。",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.zhihu.com/question/649365581")
+
+    assert "如何评价某个问题的最佳实践 - 知乎" in result
+    assert "该问题讨论了实践方式、取舍以及常见误区。" in result
+    assert "目标页被知乎风控拦截，回退为搜索结果摘要。" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_prefers_exa_search_recovery_when_available(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(0, result="<html><body>You've been blocked by network security.</body></html>"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_call_exa_search",
+        lambda _query, max_results=3, ctx=None: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "provider": "exa_search",
+                    "url": "https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/",
+                    "title": "Weekly Python Thread",
+                    "content": "Exa recovered a stronger summary for the blocked Reddit thread.",
+                    "score": 0.9,
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(server, "_call_tavily_search", lambda _query, max_results=3: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/")
+
+    assert "Weekly Python Thread" in result
+    assert "Exa recovered a stronger summary" in result
+
+
+def test_is_reliable_zhihu_search_recovery_result_filters_generic_pages():
+    generic = {
+        "url": "https://www.zhihu.com/app/",
+        "title": "知乎客户端",
+        "content": "请您登录后查看更多专业优质内容。",
+    }
+    exact = {
+        "url": "https://www.zhihu.com/question/649365581",
+        "title": "如何评价某个问题的最佳实践 - 知乎",
+        "content": "该问题讨论了实践方式、取舍以及常见误区。",
+    }
+
+    assert server._is_reliable_zhihu_search_recovery_result(generic, "https://www.zhihu.com/question/649365581") is False
+    assert server._is_reliable_zhihu_search_recovery_result(exact, "https://www.zhihu.com/question/649365581") is True
+
+
+def test_is_reliable_reddit_search_recovery_result_prefers_matching_post_id():
+    target_url = "https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/"
+    unrelated = {
+        "url": "https://www.reddit.com/r/vandwellers/comments/1xyz987/best_portable_power_station_for_the_lowest_price/",
+        "title": "Best portable power station for the lowest price?",
+        "content": "Completely unrelated Reddit thread.",
+    }
+    exact = {
+        "url": target_url,
+        "title": "What are you building with Python this week?",
+        "content": "Weekly thread for sharing Python projects.",
+    }
+
+    assert server._is_reliable_reddit_search_recovery_result(unrelated, target_url) is False
+    assert server._is_reliable_reddit_search_recovery_result(exact, target_url) is True
+
+
+def test_select_best_search_recovery_result_uses_reddit_specific_matching():
+    target_url = "https://www.reddit.com/r/programming/comments/1b5m4s6/what_happened_to_stack_overflow/"
+    wrong = {
+        "provider": "tavily_search",
+        "url": "https://www.reddit.com/r/ExperiencedDevs/comments/abcd123/was_it_ai_or_did_the_platform_kill_itself_with_elitism/",
+        "title": "Was it AI, or did the platform kill itself with elitism?",
+        "content": "This is a different discussion with longer content that should be filtered out.",
+        "score": 0.95,
+    }
+    right = {
+        "provider": "exa_search",
+        "url": target_url,
+        "title": "What happened to Stack Overflow?",
+        "content": "Discussion about Stack Overflow's decline and community changes.",
+        "score": 0.2,
+    }
+
+    winner = server._select_best_search_recovery_result([wrong, right], target_url)
+
+    assert winner == right
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_reddit_identity_fallback_when_search_recovery_has_no_reliable_results(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(0, result="<html><body>You've been blocked by network security.</body></html>"),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_call_tavily_search",
+        lambda _query, max_results=3: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "title": "Best portable power station for the lowest price?",
+                    "url": "https://www.reddit.com/r/vandwellers/comments/1xyz987/best_portable_power_station_for_the_lowest_price/",
+                    "content": "Wrong Reddit thread returned by search.",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/")
+
+    assert "Reddit r/Python thread 1c5qg8q (URL-derived topic: what are you building with python this week)" in result
+    assert "fallback_mode: url_identity_summary" in result
+    assert "different Reddit post" in result
+    assert "not treated as a verified public title" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_reddit_identity_fallback_when_raw_html_fetch_fails(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_raw_html", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_tavily_search", lambda _query, max_results=3: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/")
+
+    assert "Reddit r/Python thread 1c5qg8q (URL-derived topic: what are you building with python this week)" in result
+    assert "fallback_mode: url_identity_summary" in result
+    assert "目标页抓取失败；未恢复到同帖公开摘要" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_prefers_reddit_json_fallback_when_available(monkeypatch):
+    reddit_json = json.dumps(
+        [
+            {
+                "kind": "Listing",
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t3",
+                            "data": {
+                                "title": "What are you building with Python this week?",
+                                "subreddit_name_prefixed": "r/Python",
+                                "author": "weekly-bot",
+                                "selftext": "Share your projects and progress.",
+                                "score": 42,
+                                "num_comments": 9,
+                                "permalink": "/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/",
+                            },
+                        }
+                    ]
+                },
+            },
+            {"kind": "Listing", "data": {"children": []}},
+        ],
+        ensure_ascii=False,
+    )
+
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_fetch_reddit_json_fallback", lambda _url, _ctx=None: asyncio.sleep(0, result=reddit_json))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(0, result="<html><body>You've been blocked by network security.</body></html>"),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_tavily_search", lambda _query, max_results=3: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.reddit.com/r/Python/comments/1c5qg8q/what_are_you_building_with_python_this_week/")
+
+    assert "What are you building with Python this week?" in result
+    assert "Share your projects and progress." in result
+    assert "fallback_mode: reddit_json_summary" in result
+    assert "json_recovery_provider:" in result
+    assert "目标页被 Reddit 反爬拦截，回退为同帖 JSON 元数据摘要。" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_zhihu_identity_fallback_when_search_recovery_has_no_reliable_results(monkeypatch):
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(
+            0,
+            result="<html><body>知乎，让每一次点击都充满意义 —— 欢迎来到知乎，发现问题背后的世界。</body></html>",
+        ),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_call_tavily_search",
+        lambda _query, max_results=3: asyncio.sleep(
+            0,
+            result=[
+                {
+                    "title": "知乎客户端",
+                    "url": "https://www.zhihu.com/app/",
+                    "content": "请您登录后查看更多专业优质内容。",
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.zhihu.com/question/649365581")
+
+    assert "知乎问题 649365581" in result
+    assert "fallback_mode: url_identity_summary" in result
+    assert "可验证的公开标题或摘要" in result
+
+
+@pytest.mark.asyncio
+async def test_build_zhihu_search_recovery_queries_covers_question_and_article_ids():
+    question_queries = server._build_zhihu_search_recovery_queries(
+        "https://www.zhihu.com/question/649365581/answer/3552952553"
+    )
+    article_queries = server._build_zhihu_search_recovery_queries(
+        "https://zhuanlan.zhihu.com/p/638427200"
+    )
+
+    assert question_queries == (
+        "site:zhihu.com https://www.zhihu.com/question/649365581/answer/3552952553",
+        "site:zhihu.com/question/649365581",
+        "site:zhihu.com/question 649365581",
+        "site:zhihu.com/question/649365581/answer/3552952553",
+        "site:zhihu.com/answer 3552952553",
+    )
+    assert article_queries == (
+        "site:zhuanlan.zhihu.com https://zhuanlan.zhihu.com/p/638427200",
+        "site:zhuanlan.zhihu.com/p/638427200",
+        "site:zhuanlan.zhihu.com 638427200",
+    )
+
+
+@pytest.mark.asyncio
+async def test_zhihu_search_recovery_filters_shell_results_from_title_and_url(monkeypatch):
+    shell_like = {
+        "url": "https://www.zhihu.com/question/649365581?utm_psn=bad",
+        "title": "知乎，让每一次点击都充满意义",
+        "content": "欢迎来到知乎，发现问题背后的世界 need_login=true",
+    }
+    reliable = {
+        "url": "https://www.zhihu.com/question/649365581",
+        "title": "如何评价某个问题？ - 知乎",
+        "content": "这是该知乎问题的公开摘要片段。",
+    }
+
+    assert server._is_reliable_zhihu_search_recovery_result(
+        shell_like,
+        "https://www.zhihu.com/question/649365581",
+    ) is False
+    assert server._is_reliable_zhihu_search_recovery_result(
+        reliable,
+        "https://www.zhihu.com/question/649365581",
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_returns_failure_when_site_fallback_recovery_has_no_results(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "dummy-key")
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        server,
+        "_fetch_raw_html",
+        lambda _url, _ctx=None: asyncio.sleep(
+            0,
+            result="<html><body>知乎，让每一次点击都充满意义 —— 欢迎来到知乎，发现问题背后的世界。</body></html>",
+        ),
+    )
+    monkeypatch.setattr(server, "_call_exa_search", lambda _query, max_results=3, ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_tavily_search", lambda _query, max_results=3: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_search", lambda _query, limit=3: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://www.zhihu.com/question/649365581")
+
+    assert "知乎问题 649365581" in result
+    assert "fallback_mode: url_identity_summary" in result
+
+
+def test_select_best_fetch_candidate_prefers_non_low_quality_candidate():
+    low_quality = server._build_fetch_candidate(
+        "exa",
+        "\n".join([
+            "Navigation Menu",
+            "Skip to content",
+            "Saved searches",
+            "Provide feedback",
+            "Sign in",
+        ]),
+        "https://github.com/org/repo/issues/1",
+    )
+    valid = server._build_fetch_candidate(
+        "tavily",
+        "\n".join([
+            "# Actual Issue",
+            "",
+            "## Details",
+            "This is the real issue body with meaningful text that should outrank the shell content.",
+            "",
+            "## Notes",
+            "The response includes enough structure to be considered substantive.",
+        ]),
+        "https://github.com/org/repo/issues/1",
+    )
+
+    winner = server._select_best_fetch_candidate([low_quality, valid])
+
+    assert winner is not None
+    assert winner["provider"] == "tavily"
+    assert winner["is_low_quality"] is False
+
+
+def test_low_quality_fetch_detection_flags_github_shell_content():
+    content = "\n".join([
+        "Navigation Menu",
+        "Skip to content",
+        "Search or jump to...",
+        "Saved searches",
+        "Use saved searches to filter your results more quickly",
+        "Sign in",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://github.com/org/repo/issues/123") is True
+
+
+def test_low_quality_fetch_detection_flags_reddit_app_shell_content():
+    content = "\n".join([
+        "Reddit - Dive into anything",
+        "Open menu",
+        "Create account",
+        "Get App",
+        "Back to Top",
+        "Use App",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.reddit.com/r/python/comments/abc123/example") is True
+
+
+def test_low_quality_fetch_detection_flags_reddit_verification_page():
+    content = "\n".join([
+        "Reddit - Please wait for verification",
+        "js_challenge",
+        "solution",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.reddit.com/r/python/comments/abc123/example") is True
+
+
+def test_low_quality_fetch_detection_flags_zhihu_login_shell_content():
+    content = "\n".join([
+        "知乎，让每一次点击都充满意义",
+        "打开知乎 App",
+        "登录/注册后即可查看更多内容",
+        "查看全部回答",
+        "写回答",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.zhihu.com/question/123456") is True
+
+
+def test_low_quality_fetch_detection_flags_zhihu_risk_page():
+    content = "\n".join([
+        "知乎，让每一次点击都充满意义 —— 欢迎来到知乎，发现问题背后的世界。",
+        "account/unhuman?need_login=true",
+        "zse-ck",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.zhihu.com/question/123456") is True
+
+
+def test_low_quality_fetch_detection_flags_juejin_login_shell_content():
+    content = "\n".join([
+        "稀土掘金",
+        "打开 App",
+        "登录后查看更多优质内容",
+        "点赞",
+        "评论",
+        "收藏",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://juejin.cn/post/123456789") is True
+
+
+def test_low_quality_fetch_detection_flags_juejin_not_found_shell_content():
+    content = "\n".join([
+        "找不到页面",
+        "\"statusCode\":404",
+        "\"errorView\":\"NotFoundView\"",
+        "verifyCenter",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://juejin.cn/post/123456789") is True
+
+
+def test_low_quality_fetch_detection_flags_cnblogs_sidebar_shell_content():
+    content = "\n".join([
+        "公告",
+        "昵称：test",
+        "园龄：3年",
+        "粉丝：10",
+        "关注：2",
+        "积分与排名",
+        "随笔档案",
+        "阅读排行榜",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.cnblogs.com/test/p/example.html") is True
+
+
+def test_low_quality_fetch_detection_flags_cnblogs_404_page():
+    content = "\n".join([
+        "[![](https://common.cnblogs.com/logo.svg)](https://www.cnblogs.com/)",
+        "404 - 您访问的页面不存在",
+        "可能是网址有误，或者对应的内容已被删除，或者处于私有状态",
+        "邮件联系：contact@cnblogs.com",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://www.cnblogs.com/test/p/missing.html") is True
+
+
+def test_low_quality_fetch_detection_keeps_real_github_issue_content():
+    content = "\n".join([
+        "# Bug: MCP web_fetch returns shell page",
+        "",
+        "## Description",
+        "When requesting a GitHub Issue URL through the fetch pipeline, the response sometimes returns only navigation chrome instead of the actual discussion body.",
+        "",
+        "## Reproduction",
+        "1. Open the issue URL directly.",
+        "2. Observe that the page contains the full issue body and comments.",
+        "3. Compare it with the extracted markdown output.",
+        "",
+        "```text",
+        "Expected: full issue content",
+        "Actual: shell content only",
+        "```",
+    ])
+
+    assert server._is_low_quality_fetch_result(content, "https://github.com/org/repo/issues/123") is False
+
+
+def test_build_fetch_candidate_penalizes_firecrawl_for_github_shell_pages():
+    exa_candidate = server._build_fetch_candidate(
+        "exa",
+        "\n".join([
+            "# lsdefine/GenericAgent",
+            "",
+            "## Overview",
+            "Self-evolving agent that grows a reusable skill tree.",
+        ]),
+        "https://github.com/lsdefine/GenericAgent/tree/main",
+    )
+    firecrawl_candidate = server._build_fetch_candidate(
+        "firecrawl",
+        "\n".join([
+            "# lsdefine/GenericAgent",
+            "",
+            "## Overview",
+            "Self-evolving agent that grows a reusable skill tree.",
+        ]),
+        "https://github.com/lsdefine/GenericAgent/tree/main",
+    )
+
+    assert exa_candidate is not None
+    assert firecrawl_candidate is not None
+    assert exa_candidate["score"] > firecrawl_candidate["score"]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_reports_missing_all_fetch_keys(monkeypatch):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.setattr(server, "_call_tavily_extract", lambda _url: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(server, "_call_exa_contents", lambda _url, _ctx=None: asyncio.sleep(0, result=None))
+
+    result = await server.web_fetch("https://example.com/page")
+
+    assert "TAVILY_API_KEY" in result
+    assert "FIRECRAWL_API_KEY" in result
+    assert "EXA_API_KEY" in result
 
 
 @pytest.mark.asyncio

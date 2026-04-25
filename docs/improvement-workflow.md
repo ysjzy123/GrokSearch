@@ -159,8 +159,10 @@ Use this exact sequence for every change batch:
 3. Run `uv run --with pytest --with pytest-asyncio pytest -q`.
 4. Run `uv run python scripts/compare_versions.py`.
 5. Run `uv run python scripts/compare_versions.py --include-live` when network is available.
-6. Compare category deltas and gating failures.
-7. Append the outcome to Obsidian with keep/revert decision.
+6. When the change touches `web_fetch`, also run `uv run python scripts/compare_versions.py --include-live --benchmark-file benchmarks/web_fetch_real_urls.txt`.
+7. Optionally run `uv run python scripts/benchmark_web_fetch.py --url-file benchmarks/web_fetch_real_urls.txt --json-out benchmarks/live_fetch_benchmark_result.json` for per-provider inspection.
+8. Compare category deltas and gating failures.
+9. Append the outcome to Obsidian with keep/revert decision.
 
 ## Obsidian Logging Protocol
 
@@ -189,6 +191,23 @@ Suggested section template:
 - follow-up: next risk or next improvement
 ```
 
+## Live Fetch Benchmark Notes
+
+Use the benchmark sample file at:
+
+- `benchmarks/web_fetch_real_urls.txt`
+
+Use the benchmark runner when you need provider-level visibility instead of only score deltas:
+
+- `uv run python scripts/benchmark_web_fetch.py --url-file benchmarks/web_fetch_real_urls.txt --json-out benchmarks/live_fetch_benchmark_result.json`
+- add `--artifact-dir benchmarks/live_fetch_artifacts` only when you need raw provider markdown outputs for manual review
+
+Treat the following as generated artifacts and keep them out of git unless there is a deliberate reason to preserve them:
+
+- `benchmarks/live_fetch_artifacts*/`
+- `benchmarks/live_*.json`
+- ad-hoc `*.bak.*` backups
+
 ## Current Improvement Themes
 
 The current roadmap prioritizes:
@@ -201,4 +220,4 @@ The current roadmap prioritizes:
 6. budget-aware efficiency and early-stop behavior
 7. cache persistence
 8. live benchmark expansion
-7. maintainability and provider extensibility
+9. maintainability and provider extensibility

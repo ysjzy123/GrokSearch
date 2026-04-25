@@ -125,6 +125,19 @@ class Config:
         return self._getenv("FIRECRAWL_API_KEY")
 
     @property
+    def exa_enabled(self) -> bool:
+        return self._getenv_bool("EXA_ENABLED", "true")
+
+    @property
+    def exa_api_url(self) -> str:
+        url = self._getenv("EXA_API_URL")
+        return url or "https://api.exa.ai"
+
+    @property
+    def exa_api_key(self) -> str | None:
+        return self._getenv("EXA_API_KEY")
+
+    @property
     def log_level(self) -> str:
         return (self._getenv("GROK_LOG_LEVEL", "INFO") or "INFO").upper()
 
@@ -219,6 +232,9 @@ class Config:
             "TAVILY_API_KEY": self._mask_api_key(self.tavily_api_key) if self.tavily_api_key else "未配置",
             "FIRECRAWL_API_URL": self.firecrawl_api_url,
             "FIRECRAWL_API_KEY": self._mask_api_key(self.firecrawl_api_key) if self.firecrawl_api_key else "未配置",
+            "EXA_API_URL": self.exa_api_url,
+            "EXA_ENABLED": self.exa_enabled,
+            "EXA_API_KEY": self._mask_api_key(self.exa_api_key) if self.exa_api_key else "未配置",
             "config_status": config_status,
         }
         return info

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from urllib.parse import urlparse
 
 
 _ATX_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+_YAML_FIELD_PATTERN = re.compile(r"^[A-Za-z0-9_-]+:\s+.+$")
 _MARKDOWN_TABLE_SEPARATOR_PATTERN = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 _HTML_TABLE_PATTERN = re.compile(r"(?is)<table\b[^>]*>.*?</table>")
 _HTML_ROW_BLOCK_PATTERN = re.compile(r"(?is)(?:<tr\b[^>]*>.*?</tr>\s*){2,}")
@@ -33,10 +35,192 @@ def _fallback_title_from_url(url: str) -> str:
     return parsed.netloc or url
 
 
+def _normalize_json_like_text(value: str) -> str:
+    normalized = value.strip()
+    fence_match = re.match(r"(?is)^```(?:json)?\s*(.*?)\s*```$", normalized)
+    if fence_match:
+        normalized = fence_match.group(1).strip()
+    normalized = normalized.replace("\\\\_", "\\u005f")
+    normalized = normalized.replace("\\_", "_")
+    normalized = normalized.replace("\\-", "-")
+    normalized = normalized.replace("\\*", "*")
+    normalized = normalized.replace("\\`", "`")
+    return normalized
+
+
+def _decode_json_like_string(value: str) -> str:
+    normalized = value.replace("\\\\_", "\\u005f")
+    normalized = normalized.replace("\\_", "_")
+    normalized = normalized.replace("\\-", "-")
+    normalized = normalized.replace("\\*", "*")
+    normalized = normalized.replace("\\`", "`")
+    try:
+        return json.loads(f'"{normalized}"')
+    except json.JSONDecodeError:
+        return normalized.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+
+
+def _extract_json_like_string_field(text: str, key: str) -> str:
+    pattern = rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"'
+    match = re.search(pattern, text)
+    if not match:
+        return ""
+    return _decode_json_like_string(match.group(1)).strip()
+
+
+def _extract_json_like_int_field(text: str, key: str) -> int | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(-?\d+)', text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_json_like_bool_field(text: str, key: str) -> bool | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', text)
+    if not match:
+        return None
+    return match.group(1) == "true"
+
+
+def extract_reddit_json_post_fields(text: str) -> dict[str, object] | None:
+    normalized_text = _normalize_json_like_text(text)
+    try:
+        payload = json.loads(normalized_text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, list) and payload:
+        listing = payload[0] if isinstance(payload[0], dict) else {}
+        children = (((listing.get("data") or {}).get("children")) or []) if isinstance(listing, dict) else []
+        if children:
+            first = children[0] if isinstance(children[0], dict) else {}
+            post = first.get("data") if isinstance(first, dict) else None
+            if isinstance(post, dict):
+                return post
+
+    fallback_text = normalized_text
+    title = _extract_json_like_string_field(fallback_text, "title")
+    subreddit = _extract_json_like_string_field(fallback_text, "subreddit")
+    subreddit_name_prefixed = _extract_json_like_string_field(fallback_text, "subreddit_name_prefixed")
+    author = _extract_json_like_string_field(fallback_text, "author")
+    selftext = _extract_json_like_string_field(fallback_text, "selftext")
+    permalink = _extract_json_like_string_field(fallback_text, "permalink")
+    post_id = _extract_json_like_string_field(fallback_text, "id")
+    removed_by_category = _extract_json_like_string_field(fallback_text, "removed_by_category")
+    score = _extract_json_like_int_field(fallback_text, "score")
+    num_comments = _extract_json_like_int_field(fallback_text, "num_comments")
+    over_18 = _extract_json_like_bool_field(fallback_text, "over_18")
+
+    if not any((title, subreddit, subreddit_name_prefixed, author, selftext, permalink, post_id)):
+        return None
+
+    return {
+        "title": title,
+        "subreddit": subreddit,
+        "subreddit_name_prefixed": subreddit_name_prefixed,
+        "author": author,
+        "selftext": selftext,
+        "permalink": permalink,
+        "id": post_id,
+        "removed_by_category": removed_by_category,
+        "score": score,
+        "num_comments": num_comments,
+        "over_18": over_18,
+    }
+
+
+def _extract_reddit_json_post_markdown(url: str, text: str) -> str | None:
+    post = extract_reddit_json_post_fields(text)
+    if not isinstance(post, dict):
+        return None
+
+    title = str(post.get("title") or "").strip()
+    subreddit = str(post.get("subreddit_name_prefixed") or post.get("subreddit") or "").strip()
+    author = str(post.get("author") or "").strip()
+    body = str(post.get("selftext") or "").strip()
+    permalink = str(post.get("permalink") or "").strip()
+    score = post.get("score")
+    num_comments = post.get("num_comments")
+    over_18 = post.get("over_18")
+    removed_by_category = str(post.get("removed_by_category") or "").strip().lower()
+
+    title_lower = title.lower()
+    suspicious_title_markers = (
+        "reddit - the heart of the internet",
+        "reddit - dive into anything",
+    )
+    if not title or title_lower in suspicious_title_markers:
+        return None
+    if removed_by_category in {"deleted", "removed"}:
+        return None
+    if str(author).strip().lower() == "[deleted]" and body in {"", "[removed]", "[deleted]"}:
+        return None
+    if over_18 is True:
+        return None
+
+    parts = [f"# {title}", ""]
+    parts.append("## Thread Metadata")
+    parts.append("")
+    parts.append(f"- source_format: reddit_json")
+    if subreddit:
+        parts.append(f"- subreddit: {subreddit}")
+    if author:
+        parts.append(f"- author: {author}")
+    if score is not None:
+        parts.append(f"- score: {score}")
+    if num_comments is not None:
+        parts.append(f"- comment_count: {num_comments}")
+    if permalink:
+        parts.append(f"- permalink: https://www.reddit.com{permalink}")
+    parts.append("")
+
+    if body and body not in {"[removed]", "[deleted]"}:
+        parts.append("## Post Body")
+        parts.append("")
+        parts.append(body)
+        parts.append("")
+    else:
+        parts.append("> Reddit JSON endpoint exposed the thread metadata, but the post body is unavailable.")
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
 def infer_title(text: str, url: str) -> str:
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    if domain == "reddit.com" or domain.endswith(".reddit.com"):
+        if parsed.path.endswith(".json"):
+            markdown = _extract_reddit_json_post_markdown(url, text)
+            if markdown:
+                for raw_line in markdown.splitlines():
+                    line = raw_line.strip()
+                    if line.startswith("# "):
+                        title = _clean_markdown_text(line[2:])
+                        if title:
+                            return title
+    if domain == "github.com" or domain.endswith(".github.com"):
+        github_title_match = re.search(r"GitHub\s*-\s*([^:·\n]+(?:/[^:·\n]+)?)", text)
+        if github_title_match:
+            title = _clean_markdown_text(github_title_match.group(1))
+            if title:
+                return title
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```") or _YAML_FIELD_PATTERN.match(line):
+                continue
+            if line.startswith("# "):
+                title = _clean_markdown_text(line[2:])
+                if title:
+                    return title
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("```"):
+            continue
+        if _YAML_FIELD_PATTERN.match(line):
             continue
         heading_match = _ATX_HEADING_PATTERN.match(line)
         if heading_match:
@@ -178,6 +362,12 @@ def augment_fetched_markdown(url: str, text: str) -> str:
     content = (text or "").strip()
     if not content:
         return text
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    if (domain == "reddit.com" or domain.endswith(".reddit.com")) and parsed.path.endswith(".json"):
+        normalized = _extract_reddit_json_post_markdown(url, content)
+        if normalized:
+            content = normalized
 
     title = infer_title(content, url)
     headings = extract_heading_outline(content)
